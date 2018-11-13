@@ -296,6 +296,10 @@ public class ImsPhoneConnection extends Connection implements
                 capabilities = addCapability(capabilities,
                         Connection.Capability.SUPPORTS_VT_LOCAL_BIDIRECTIONAL);
                 break;
+            case ImsCallProfile.CALL_TYPE_UNKNOWN:
+                capabilities = removeCapability(capabilities,
+                        Connection.Capability.SUPPORTS_DOWNGRADE_TO_VOICE_LOCAL);
+                break;
         }
         return capabilities;
     }
@@ -311,6 +315,10 @@ public class ImsPhoneConnection extends Connection implements
             case ImsCallProfile.CALL_TYPE_VIDEO_N_VOICE:
                 capabilities = addCapability(capabilities,
                         Connection.Capability.SUPPORTS_VT_REMOTE_BIDIRECTIONAL);
+                break;
+            case ImsCallProfile.CALL_TYPE_UNKNOWN:
+                capabilities = removeCapability(capabilities,
+                        Connection.Capability.SUPPORTS_DOWNGRADE_TO_VOICE_REMOTE);
                 break;
         }
 
@@ -1009,12 +1017,24 @@ public class ImsPhoneConnection extends Connection implements
         setVideoState(newVideoState);
     }
 
-    public void sendRttModifyRequest(android.telecom.Connection.RttTextStream textStream) {
+
+    /**
+     * Send a RTT upgrade request to the remote party.
+     * @param textStream RTT text stream to use
+     */
+    public void startRtt(android.telecom.Connection.RttTextStream textStream) {
         ImsCall imsCall = getImsCall();
         if (imsCall != null) {
-            getImsCall().sendRttModifyRequest();
+            getImsCall().sendRttModifyRequest(true);
             setCurrentRttTextStream(textStream);
         }
+    }
+
+    /**
+     * Terminate the current RTT session.
+     */
+    public void stopRtt() {
+        getImsCall().sendRttModifyRequest(false);
     }
 
     /**
@@ -1104,26 +1124,28 @@ public class ImsPhoneConnection extends Connection implements
     }
 
     /**
-     * Updates the wifi state based on the {@link ImsCallProfile#EXTRA_CALL_RAT_TYPE}.
-     * The call is considered to be a WIFI call if the extra value is
-     * {@link ServiceState#RIL_RADIO_TECHNOLOGY_IWLAN}.
+     * Updates the IMS call rat based on the {@link ImsCallProfile#EXTRA_CALL_RAT_TYPE}.
      *
      * @param extras The ImsCallProfile extras.
      */
-    private void updateWifiStateFromExtras(Bundle extras) {
+    private void updateImsCallRatFromExtras(Bundle extras) {
         if (extras.containsKey(ImsCallProfile.EXTRA_CALL_RAT_TYPE) ||
                 extras.containsKey(ImsCallProfile.EXTRA_CALL_RAT_TYPE_ALT)) {
 
             ImsCall call = getImsCall();
-            boolean isWifi = false;
+            int callTech = ServiceState.RIL_RADIO_TECHNOLOGY_UNKNOWN;
             if (call != null) {
-                isWifi = call.isWifiCall();
+                callTech = call.getRadioTechnology();
             }
 
-            // Report any changes
-            if (isWifi() != isWifi) {
-                setWifi(isWifi);
-            }
+            // Report any changes for call tech change
+            setCallRadioTech(callTech);
+        }
+    }
+
+    private void updateEmergencyCallFromExtras(Bundle extras) {
+        if (extras.getBoolean(ImsCallProfile.EXTRA_EMERGENCY_CALL)) {
+            setIsNetworkIdentifiedEmergencyCall(true);
         }
     }
 
@@ -1147,8 +1169,8 @@ public class ImsPhoneConnection extends Connection implements
 
         final boolean changed = !areBundlesEqual(extras, mExtras);
         if (changed) {
-            updateWifiStateFromExtras(extras);
-
+            updateImsCallRatFromExtras(extras);
+            updateEmergencyCallFromExtras(extras);
             mExtras.clear();
             mExtras.putAll(extras);
             setConnectionExtras(mExtras);

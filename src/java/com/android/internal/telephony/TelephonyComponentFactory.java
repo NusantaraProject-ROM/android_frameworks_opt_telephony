@@ -27,6 +27,7 @@ import android.telephony.AccessNetworkConstants.TransportType;
 
 import com.android.internal.telephony.cdma.CdmaSubscriptionSourceManager;
 import com.android.internal.telephony.cdma.EriManager;
+import com.android.internal.telephony.dataconnection.AccessNetworksManager;
 import com.android.internal.telephony.dataconnection.DcTracker;
 import com.android.internal.telephony.imsphone.ImsExternalCallTracker;
 import com.android.internal.telephony.imsphone.ImsPhone;
@@ -54,7 +55,8 @@ public class TelephonyComponentFactory {
     public static TelephonyComponentFactory getInstance() {
         if (sInstance == null) {
             String fullClsName = "com.qualcomm.qti.internal.telephony.QtiTelephonyComponentFactory";
-            String libPath = "/system/framework/qti-telephony-common.jar";
+            String libPath = "/system/framework/qti-telephony-common.jar"
+                    + ":/system/framework/android.hidl.manager-V1.0-java.jar";
 
             PathClassLoader classLoader = new PathClassLoader(libPath,
                     ClassLoader.getSystemClassLoader());
@@ -218,6 +220,10 @@ public class TelephonyComponentFactory {
 
     public DeviceStateMonitor makeDeviceStateMonitor(Phone phone) {
         return new DeviceStateMonitor(phone);
+    }
+
+    public AccessNetworksManager makeAccessNetworksManager(Phone phone) {
+        return new AccessNetworksManager(phone);
     }
 
     public CdmaSubscriptionSourceManager

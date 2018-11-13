@@ -143,6 +143,7 @@ public class GsmCdmaPhoneTest extends TelephonyTest {
         mPhoneUT.removeCallbacksAndMessages(null);
         mPhoneUT = null;
         mGsmCdmaPhoneTestHandler.quit();
+        mGsmCdmaPhoneTestHandler.join();
         super.tearDown();
     }
 
@@ -239,40 +240,19 @@ public class GsmCdmaPhoneTest extends TelephonyTest {
         CellLocation cellLocation = new GsmCellLocation();
         WorkSource workSource = new WorkSource(Process.myUid(),
             mContext.getPackageName());
-        doReturn(cellLocation).when(mSST).getCellLocation(workSource);
-        assertEquals(cellLocation, mPhoneUT.getCellLocation(workSource));
+        doReturn(cellLocation).when(mSST).getCellLocation();
+        assertEquals(cellLocation, mPhoneUT.getCellLocation());
 
         // Switch to CDMA
         switchToCdma();
 
         CdmaCellLocation cdmaCellLocation = new CdmaCellLocation();
-        cdmaCellLocation.setCellLocationData(0, 0, 0, 0, 0);
-        mSST.mCellLoc = cdmaCellLocation;
-
-        /*
-        LOCATION_MODE is a special case in SettingsProvider. Adding the special handling in mock
-        content provider is probably not worth the effort; it will also tightly couple tests with
-        SettingsProvider implementation.
-        // LOCATION_MODE_ON
-        Settings.Secure.putInt(mContext.getContentResolver(),
-                Settings.Secure.LOCATION_MODE, Settings.Secure.LOCATION_MODE_HIGH_ACCURACY);
-        waitForMs(50);
-        CdmaCellLocation actualCellLocation = (CdmaCellLocation) mPhoneUT.getCellLocation();
-        assertEquals(0, actualCellLocation.getBaseStationLatitude());
-        assertEquals(0, actualCellLocation.getBaseStationLongitude());
-
-        // LOCATION_MODE_OFF
-        Settings.Secure.putInt(TestApplication.getAppContext().getContentResolver(),
-                Settings.Secure.LOCATION_MODE, Settings.Secure.LOCATION_MODE_OFF);
-        waitForMs(50);
-        */
+        doReturn(cdmaCellLocation).when(mSST).getCellLocation();
 
         CdmaCellLocation actualCellLocation =
-                (CdmaCellLocation) mPhoneUT.getCellLocation(workSource);
-        assertEquals(CdmaCellLocation.INVALID_LAT_LONG,
-                actualCellLocation.getBaseStationLatitude());
-        assertEquals(CdmaCellLocation.INVALID_LAT_LONG,
-                actualCellLocation.getBaseStationLongitude());
+                (CdmaCellLocation) mPhoneUT.getCellLocation();
+
+        assertEquals(actualCellLocation, cdmaCellLocation);
     }
 
     @Test
@@ -969,5 +949,32 @@ public class GsmCdmaPhoneTest extends TelephonyTest {
         AsyncResult ret = (AsyncResult) message.obj;
         assertEquals(EVENT_SET_ICC_LOCK_ENABLED, message.what);
         assertTrue(ret.exception != null);
+    }
+
+    @Test
+    @SmallTest
+    public void testGetCsCallRadioTech() {
+        ServiceState ss = new ServiceState();
+        mSST.mSS = ss;
+
+        // vrs in-service, vrat umts, expected umts
+        ss.setVoiceRegState(ServiceState.STATE_IN_SERVICE);
+        ss.setRilVoiceRadioTechnology(ServiceState.RIL_RADIO_TECHNOLOGY_UMTS);
+        assertEquals(mPhoneUT.getCsCallRadioTech(), ServiceState.RIL_RADIO_TECHNOLOGY_UMTS);
+
+        // vrs oos, vrat umts, expected unknown
+        ss.setVoiceRegState(ServiceState.STATE_OUT_OF_SERVICE);
+        ss.setRilVoiceRadioTechnology(ServiceState.RIL_RADIO_TECHNOLOGY_UMTS);
+        assertEquals(mPhoneUT.getCsCallRadioTech(), ServiceState.RIL_RADIO_TECHNOLOGY_UNKNOWN);
+
+        // vrs in-service, vrat lte, expected unknown
+        ss.setVoiceRegState(ServiceState.STATE_IN_SERVICE);
+        ss.setRilVoiceRadioTechnology(ServiceState.RIL_RADIO_TECHNOLOGY_LTE);
+        assertEquals(mPhoneUT.getCsCallRadioTech(), ServiceState.RIL_RADIO_TECHNOLOGY_UNKNOWN);
+
+        // vrs in-service, vrat iwlan, expected unknown
+        ss.setVoiceRegState(ServiceState.STATE_IN_SERVICE);
+        ss.setRilVoiceRadioTechnology(ServiceState.RIL_RADIO_TECHNOLOGY_IWLAN);
+        assertEquals(mPhoneUT.getCsCallRadioTech(), ServiceState.RIL_RADIO_TECHNOLOGY_UNKNOWN);
     }
 }

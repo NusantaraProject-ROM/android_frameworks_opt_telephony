@@ -37,7 +37,6 @@ import android.os.AsyncResult;
 import android.os.BaseBundle;
 import android.os.Build;
 import android.os.Handler;
-import android.os.HandlerThread;
 import android.os.Message;
 import android.os.PersistableBundle;
 import android.os.Registrant;
@@ -58,9 +57,6 @@ import android.telephony.CellIdentityLte;
 import android.telephony.CellIdentityTdscdma;
 import android.telephony.CellIdentityWcdma;
 import android.telephony.CellInfo;
-import android.telephony.CellInfoGsm;
-import android.telephony.CellInfoLte;
-import android.telephony.CellInfoWcdma;
 import android.telephony.CellLocation;
 import android.telephony.DataSpecificRegistrationStates;
 import android.telephony.NetworkRegistrationState;
@@ -105,7 +101,9 @@ import java.io.FileDescriptor;
 import java.io.PrintWriter;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.LinkedList;
 import java.util.List;
+import java.util.Objects;
 import java.util.TimeZone;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.PatternSyntaxException;
@@ -130,8 +128,22 @@ public class ServiceStateTracker extends Handler {
     public ServiceState mSS;
     private ServiceState mNewSS;
 
+    // This is the minimum interval at which CellInfo requests will be serviced by the modem.
+    // Any requests that arrive within MAX_AGE of the previous reuqest will simply receive the
+    // cached result. This is a power-saving feature, because requests to the modem may require
+    // wakeup of a separate chip and bus communication. Because the cost of wakeups is
+    // architecture dependent, it would be preferable if this sort of optimization could be
+    // handled in SoC-specific code, but for now, keep it here to ensure that in case further
+    // optimizations are not present elsewhere, there is a power-management scheme of last resort.
     private static final long LAST_CELL_INFO_LIST_MAX_AGE_MS = 2000;
-    private long mLastCellInfoListTime;
+
+    // Maximum time to wait for a CellInfo request before assuming it won't arrive and returning
+    // null to callers. Note, that if a CellInfo response does arrive later, then it will be
+    // treated as an UNSOL, which means it will be cached as well as sent to registrants; thus,
+    // this only impacts the behavior of one-shot requests (be they blocking or non-blocking).
+    private static final long CELL_INFO_LIST_QUERY_TIMEOUT = 2000;
+
+    private long mLastCellInfoReqTime;
     private List<CellInfo> mLastCellInfoList = null;
     private List<PhysicalChannelConfig> mLastPhysicalChannelConfigList = null;
 
@@ -162,6 +174,7 @@ public class ServiceStateTracker extends Handler {
     private RegistrantList mDataRoamingOffRegistrants = new RegistrantList();
     protected RegistrantList mAttachedRegistrants = new RegistrantList();
     protected RegistrantList mDetachedRegistrants = new RegistrantList();
+    private RegistrantList mVoiceRegStateOrRatChangedRegistrants = new RegistrantList();
     private RegistrantList mDataRegStateOrRatChangedRegistrants = new RegistrantList();
     private RegistrantList mNetworkAttachedRegistrants = new RegistrantList();
     private RegistrantList mNetworkDetachedRegistrants = new RegistrantList();
@@ -222,15 +235,14 @@ public class ServiceStateTracker extends Handler {
     protected static final int EVENT_ALL_DATA_DISCONNECTED             = 49;
     protected static final int EVENT_PHONE_TYPE_SWITCHED               = 50;
     protected static final int EVENT_RADIO_POWER_FROM_CARRIER          = 51;
-    protected static final int EVENT_SIM_NOT_INSERTED                  = 52;
     protected static final int EVENT_IMS_SERVICE_STATE_CHANGED         = 53;
     protected static final int EVENT_RADIO_POWER_OFF_DONE              = 54;
     protected static final int EVENT_PHYSICAL_CHANNEL_CONFIG           = 55;
+    protected static final int EVENT_CELL_LOCATION_RESPONSE            = 56;
 
-    private class CellInfoResult {
-        List<CellInfo> list;
-        Object lockObj = new Object();
-    }
+    private List<Message> mPendingCellInfoRequests = new LinkedList<Message>();
+    // @GuardedBy("mPendingCellInfoRequests")
+    private boolean mIsPendingCellInfoRequest = false;
 
     /** Reason for registration denial. */
     protected static final String REGISTRATION_DENIED_GEN  = "General";
@@ -265,7 +277,6 @@ public class ServiceStateTracker extends Handler {
 
     private final RatRatcheter mRatRatcheter;
 
-    private final HandlerThread mHandlerThread;
     private final LocaleTracker mLocaleTracker;
 
     private final LocalLog mRoamingLog = new LocalLog(10);
@@ -343,14 +354,6 @@ public class ServiceStateTracker extends Handler {
                 }
                 // update voicemail count and notify message waiting changed
                 mPhone.updateVoiceMail();
-
-                // cancel notifications if we see SIM_NOT_INSERTED (This happens on bootup before
-                // the SIM is first detected and then subsequently on SIM removals)
-                if (mSubscriptionController.getSlotIndex(subId)
-                        == SubscriptionManager.SIM_NOT_INSERTED) {
-                    // this is handled on the main thread to mitigate racing with setNotification().
-                    sendMessage(obtainMessage(EVENT_SIM_NOT_INSERTED));
-                }
             }
         }
     };
@@ -358,8 +361,8 @@ public class ServiceStateTracker extends Handler {
     //Common
     protected final GsmCdmaPhone mPhone;
 
-    public CellLocation mCellLoc;
-    private CellLocation mNewCellLoc;
+    private CellIdentity mCellIdentity;
+    private CellIdentity mNewCellIdentity;
     private static final int MS_PER_HOUR = 60 * 60 * 1000;
     private final NitzStateMachine mNitzState;
     private final ContentResolver mCr;
@@ -517,12 +520,8 @@ public class ServiceStateTracker extends Handler {
                     this, EVENT_NETWORK_STATE_CHANGED, null);
         }
 
-        // Create a new handler thread dedicated for locale tracker because the blocking
-        // getAllCellInfo call requires clients calling from a different thread.
-        mHandlerThread = new HandlerThread(LocaleTracker.class.getSimpleName());
-        mHandlerThread.start();
         mLocaleTracker = TelephonyComponentFactory.getInstance().makeLocaleTracker(
-                mPhone, mHandlerThread.getLooper());
+                mPhone, getLooper());
 
         mCi.registerForImsNetworkStateChanged(this, EVENT_IMS_STATE_CHANGED, null);
         mCi.registerForRadioStateChanged(this, EVENT_RADIO_STATE_CHANGED, null);
@@ -600,7 +599,7 @@ public class ServiceStateTracker extends Handler {
         mSS = new ServiceState();
         mSS.setStateOutOfService();
         mNewSS = new ServiceState();
-        mLastCellInfoListTime = 0;
+        mLastCellInfoReqTime = 0;
         mLastCellInfoList = null;
         mSignalStrength = new SignalStrength();
         mStartedGprsRegCheck = false;
@@ -610,6 +609,8 @@ public class ServiceStateTracker extends Handler {
         mPrlVersion = null;
         mIsMinInfoReady = false;
         mNitzState.handleNetworkUnavailable();
+        mCellIdentity = null;
+        mNewCellIdentity = null;
 
         //cancel any pending pollstate request on voice tech switching
         cancelPollState();
@@ -625,12 +626,8 @@ public class ServiceStateTracker extends Handler {
             mCi.unregisterForCdmaOtaProvision(this);
             mPhone.unregisterForSimRecordsLoaded(this);
 
-            mCellLoc = new GsmCellLocation();
-            mNewCellLoc = new GsmCellLocation();
         } else {
             mPhone.registerForSimRecordsLoaded(this, EVENT_SIM_RECORDS_LOADED, null);
-            mCellLoc = new CdmaCellLocation();
-            mNewCellLoc = new CdmaCellLocation();
             mCdmaSSM = CdmaSubscriptionSourceManager.getInstance(mPhone.getContext(), mCi, this,
                     EVENT_CDMA_SUBSCRIPTION_SOURCE_CHANGED, null);
             mIsSubscriptionFromRuim = (mCdmaSSM.getCdmaSubscriptionSource() ==
@@ -661,6 +658,7 @@ public class ServiceStateTracker extends Handler {
         logPhoneTypeChange();
 
         // Tell everybody that the registration state and RAT have changed.
+        notifyVoiceRegStateRilRadioTechnologyChanged();
         notifyDataRegStateRilRadioTechnologyChanged();
     }
 
@@ -679,7 +677,6 @@ public class ServiceStateTracker extends Handler {
         mCi.unregisterForPhysicalChannelConfiguration(this);
         mSubscriptionManager
             .removeOnSubscriptionsChangedListener(mOnSubscriptionsChangedListener);
-        mHandlerThread.quit();
         mCi.unregisterForImsNetworkStateChanged(this);
         mPhone.getCarrierActionAgent().unregisterForCarrierAction(this,
                 CARRIER_ACTION_SET_RADIO_ENABLED);
@@ -708,6 +705,19 @@ public class ServiceStateTracker extends Handler {
             }
         }
         return notified;
+    }
+
+    /**
+     * Notify all mVoiceRegStateOrRatChangedRegistrants using an
+     * AsyncResult in msg.obj where AsyncResult#result contains the
+     * new RAT as an Integer Object.
+     */
+    protected void notifyVoiceRegStateRilRadioTechnologyChanged() {
+        int rat = mSS.getRilVoiceRadioTechnology();
+        int vrs = mSS.getVoiceRegState();
+        if (DBG) log("notifyVoiceRegStateRilRadioTechnologyChanged: vrs=" + vrs + " rat=" + rat);
+
+        mVoiceRegStateOrRatChangedRegistrants.notifyResult(new Pair<Integer, Integer>(vrs, rat));
     }
 
     /**
@@ -909,77 +919,6 @@ public class ServiceStateTracker extends Handler {
         }
     }
 
-    private void processCellLocationInfo(CellLocation cellLocation, CellIdentity cellIdentity) {
-        if (mPhone.isPhoneTypeGsm()) {
-            int psc = -1;
-            int cid = -1;
-            int lac = -1;
-            if (cellIdentity != null) {
-                switch (cellIdentity.getType()) {
-                    case CellInfoType.GSM: {
-                        cid = ((CellIdentityGsm) cellIdentity).getCid();
-                        lac = ((CellIdentityGsm) cellIdentity).getLac();
-                        break;
-                    }
-                    case CellInfoType.WCDMA: {
-                        cid = ((CellIdentityWcdma) cellIdentity).getCid();
-                        lac = ((CellIdentityWcdma) cellIdentity).getLac();
-                        psc = ((CellIdentityWcdma) cellIdentity).getPsc();
-                        break;
-                    }
-                    case CellInfoType.TD_SCDMA: {
-                        cid = ((CellIdentityTdscdma) cellIdentity).getCid();
-                        lac = ((CellIdentityTdscdma) cellIdentity).getLac();
-                        break;
-                    }
-                    case CellInfoType.LTE: {
-                        cid = ((CellIdentityLte) cellIdentity).getCi();
-                        lac = ((CellIdentityLte) cellIdentity).getTac();
-                        break;
-                    }
-                    default: {
-                        break;
-                    }
-                }
-            }
-            // LAC and CID are -1 if not avail
-            ((GsmCellLocation) cellLocation).setLacAndCid(lac, cid);
-            ((GsmCellLocation) cellLocation).setPsc(psc);
-        } else {
-            int baseStationId = -1;
-            int baseStationLatitude = CdmaCellLocation.INVALID_LAT_LONG;
-            int baseStationLongitude = CdmaCellLocation.INVALID_LAT_LONG;
-            int systemId = 0;
-            int networkId = 0;
-
-            if (cellIdentity != null) {
-                switch (cellIdentity.getType()) {
-                    case CellInfoType.CDMA: {
-                        baseStationId = ((CellIdentityCdma) cellIdentity).getBasestationId();
-                        baseStationLatitude = ((CellIdentityCdma) cellIdentity).getLatitude();
-                        baseStationLongitude = ((CellIdentityCdma) cellIdentity).getLongitude();
-                        systemId = ((CellIdentityCdma) cellIdentity).getSystemId();
-                        networkId = ((CellIdentityCdma) cellIdentity).getNetworkId();
-                        break;
-                    }
-                    default: {
-                        break;
-                    }
-                }
-            }
-
-            // Some carriers only return lat-lngs of 0,0
-            if (baseStationLatitude == 0 && baseStationLongitude == 0) {
-                baseStationLatitude  = CdmaCellLocation.INVALID_LAT_LONG;
-                baseStationLongitude = CdmaCellLocation.INVALID_LAT_LONG;
-            }
-
-            // Values are -1 if not available.
-            ((CdmaCellLocation) cellLocation).setCellLocationData(baseStationId,
-                    baseStationLatitude, baseStationLongitude, systemId, networkId);
-        }
-    }
-
     private int getLteEarfcn(CellIdentity cellIdentity) {
         int lteEarfcn = INVALID_LTE_EARFCN;
         if (cellIdentity != null) {
@@ -1021,6 +960,15 @@ public class ServiceStateTracker extends Handler {
                 break;
 
             case EVENT_ICC_CHANGED:
+                if (isSimAbsent()) {
+                    if (DBG) log("EVENT_ICC_CHANGED: SIM absent");
+                    // cancel notifications if SIM is removed/absent
+                    cancelAllNotifications();
+                    // clear cached values on SIM removal
+                    mMdn = null;
+                    mMin = null;
+                    mIsMinInfoReady = false;
+                }
                 onUpdateIccAvailability();
                 if (mUiccApplcation != null
                         && mUiccApplcation.getState() != AppState.APPSTATE_READY) {
@@ -1029,40 +977,53 @@ public class ServiceStateTracker extends Handler {
                 }
                 break;
 
-            case EVENT_GET_CELL_INFO_LIST: {
-                ar = (AsyncResult) msg.obj;
-                CellInfoResult result = (CellInfoResult) ar.userObj;
-                synchronized(result.lockObj) {
+            case EVENT_GET_CELL_INFO_LIST: // fallthrough
+            case EVENT_UNSOL_CELL_INFO_LIST: {
+                List<CellInfo> cellInfo = null;
+                Throwable ex = null;
+                if (msg.obj != null) {
+                    ar = (AsyncResult) msg.obj;
                     if (ar.exception != null) {
                         log("EVENT_GET_CELL_INFO_LIST: error ret null, e=" + ar.exception);
-                        result.list = null;
+                        ex = ar.exception;
+                    } else if (ar.result == null) {
+                        loge("Invalid CellInfo result");
                     } else {
-                        result.list = (List<CellInfo>) ar.result;
-
+                        cellInfo = (List<CellInfo>) ar.result;
+                        mLastCellInfoList = cellInfo;
+                        mPhone.notifyCellInfo(cellInfo);
                         if (VDBG) {
-                            log("EVENT_GET_CELL_INFO_LIST: size=" + result.list.size()
-                                    + " list=" + result.list);
+                            log("CELL_INFO_LIST: size=" + cellInfo.size() + " list=" + cellInfo);
                         }
                     }
-                    mLastCellInfoListTime = SystemClock.elapsedRealtime();
-                    mLastCellInfoList = result.list;
-                    result.lockObj.notify();
-                }
-                break;
-            }
-
-            case EVENT_UNSOL_CELL_INFO_LIST: {
-                ar = (AsyncResult) msg.obj;
-                if (ar.exception != null) {
-                    log("EVENT_UNSOL_CELL_INFO_LIST: error ignoring, e=" + ar.exception);
                 } else {
-                    List<CellInfo> list = (List<CellInfo>) ar.result;
-                    if (VDBG) {
-                        log("EVENT_UNSOL_CELL_INFO_LIST: size=" + list.size() + " list=" + list);
+                    // If we receive an empty message, it's probably a timeout; if there is no
+                    // pending request, drop it.
+                    if (!mIsPendingCellInfoRequest) break;
+                    // If there is a request pending, we still need to check whether it's a timeout
+                    // for the current request of whether it's leftover from a previous request.
+                    final long curTime = SystemClock.elapsedRealtime();
+                    if ((curTime - mLastCellInfoReqTime) <  CELL_INFO_LIST_QUERY_TIMEOUT) {
+                        break;
                     }
-                    mLastCellInfoListTime = SystemClock.elapsedRealtime();
-                    mLastCellInfoList = list;
-                    mPhone.notifyCellInfo(list);
+                    // We've received a legitimate timeout, so something has gone terribly wrong.
+                    loge("Timeout waiting for CellInfo; (everybody panic)!");
+                    mLastCellInfoList = null;
+                    // Since the timeout is applicable, fall through and update all synchronous
+                    // callers with the failure.
+                }
+                synchronized (mPendingCellInfoRequests) {
+                    // If we have pending requests, then service them. Note that in case of a
+                    // timeout, we send null responses back to the callers.
+                    if (mIsPendingCellInfoRequest) {
+                        // regardless of timeout or valid response, when something arrives,
+                        mIsPendingCellInfoRequest = false;
+                        for (Message m : mPendingCellInfoRequests) {
+                            AsyncResult.forMessage(m, cellInfo, ex);
+                            m.sendToTarget();
+                        }
+                        mPendingCellInfoRequests.clear();
+                    }
                 }
                 break;
             }
@@ -1140,8 +1101,8 @@ public class ServiceStateTracker extends Handler {
                 if (ar.exception == null) {
                     CellIdentity cellIdentity = ((NetworkRegistrationState) ar.result)
                             .getCellIdentity();
-                    processCellLocationInfo(mCellLoc, cellIdentity);
-                    mPhone.notifyLocationChanged();
+                    mCellIdentity = cellIdentity;
+                    mPhone.notifyLocationChanged(getCellLocation());
                 }
 
                 // Release any temporary cell lock, which could have been
@@ -1257,9 +1218,8 @@ public class ServiceStateTracker extends Handler {
                     // Can't register data service while voice service is ok
                     // i.e. CREG is ok while CGREG is not
                     // possible a network or baseband side error
-                    GsmCellLocation loc = ((GsmCellLocation)mPhone.getCellLocation());
                     EventLog.writeEvent(EventLogTags.DATA_NETWORK_REGISTRATION_FAIL,
-                            mSS.getOperatorNumeric(), loc != null ? loc.getCid() : -1);
+                            mSS.getOperatorNumeric(), getCidFromCellIdentity(mCellIdentity));
                     mReportedGprsNoReg = true;
                 }
                 mStartedGprsRegCheck = false;
@@ -1276,14 +1236,6 @@ public class ServiceStateTracker extends Handler {
 
                     onRestrictedStateChanged(ar);
                 }
-                break;
-
-            case EVENT_SIM_NOT_INSERTED:
-                if (DBG) log("EVENT_SIM_NOT_INSERTED");
-                cancelAllNotifications();
-                mMdn = null;
-                mMin = null;
-                mIsMinInfoReady = false;
                 break;
 
             case EVENT_ALL_DATA_DISCONNECTED:
@@ -1476,10 +1428,40 @@ public class ServiceStateTracker extends Handler {
                 }
                 break;
 
+            case EVENT_CELL_LOCATION_RESPONSE:
+                ar = (AsyncResult) msg.obj;
+                if (ar == null) {
+                    loge("Invalid null response to getCellLocation!");
+                    break;
+                }
+                // This response means that the correct CellInfo is already cached; thus we
+                // can rely on the last cell info to already contain any cell info that is
+                // available, which means that we can return the result of the existing
+                // getCellLocation() function without any additional processing here.
+                Message rspRspMsg = (Message) ar.userObj;
+                AsyncResult.forMessage(rspRspMsg, getCellLocation(), ar.exception);
+                rspRspMsg.sendToTarget();
+                break;
+
             default:
                 log("Unhandled message with number: " + msg.what);
                 break;
         }
+    }
+
+    private boolean isSimAbsent() {
+        boolean simAbsent;
+        if (mUiccController == null) {
+            simAbsent = true;
+        } else {
+            UiccCard uiccCard = mUiccController.getUiccCard(mPhone.getPhoneId());
+            if (uiccCard == null) {
+                simAbsent = true;
+            } else {
+                simAbsent = (uiccCard.getCardState() == CardState.CARDSTATE_ABSENT);
+            }
+        }
+        return simAbsent;
     }
 
     private int[] getBandwidthsFromConfigs(List<PhysicalChannelConfig> list) {
@@ -1864,7 +1846,7 @@ public class ServiceStateTracker extends Handler {
                     }
                 }
 
-                processCellLocationInfo(mNewCellLoc, networkRegState.getCellIdentity());
+                mNewCellIdentity = networkRegState.getCellIdentity();
 
                 if (DBG) {
                     log("handlPollVoiceRegResultMessage: regState=" + registrationState
@@ -2043,6 +2025,27 @@ public class ServiceStateTracker extends Handler {
             default:
                 return false;
         }
+    }
+
+    /**
+     * Extract the CID/CI for GSM/UTRA/EUTRA
+     *
+     * @returns the cell ID (unique within a PLMN for a given tech) or -1 if invalid
+     */
+    private static int getCidFromCellIdentity(CellIdentity id) {
+        if (id == null) return -1;
+        int cid = -1;
+        switch(id.getType()) {
+            case CellInfo.TYPE_GSM: cid = ((CellIdentityGsm) id).getCid(); break;
+            case CellInfo.TYPE_WCDMA: cid = ((CellIdentityWcdma) id).getCid(); break;
+            case CellInfo.TYPE_TDSCDMA: cid = ((CellIdentityTdscdma) id).getCid(); break;
+            case CellInfo.TYPE_LTE: cid = ((CellIdentityLte) id).getCi(); break;
+            default: break;
+        }
+        // If the CID is unreported
+        if (cid == Integer.MAX_VALUE) cid = -1;
+
+        return cid;
     }
 
     private void setPhyCellInfoFromCellIdentity(ServiceState ss, CellIdentity cellIdentity) {
@@ -2278,10 +2281,9 @@ public class ServiceStateTracker extends Handler {
             //
             // 2) Show PLMN + Wi-Fi Calling if there is no valid SPN in case 1
 
-            String[] wfcSpnFormats = mPhone.getContext().getResources().getStringArray(
-                    com.android.internal.R.array.wfcSpnFormats);
             int voiceIdx = 0;
             int dataIdx = 0;
+            boolean useRootLocale = false;
             CarrierConfigManager configLoader = (CarrierConfigManager)
                     mPhone.getContext().getSystemService(Context.CARRIER_CONFIG_SERVICE);
             if (configLoader != null) {
@@ -2291,10 +2293,25 @@ public class ServiceStateTracker extends Handler {
                         voiceIdx = b.getInt(CarrierConfigManager.KEY_WFC_SPN_FORMAT_IDX_INT);
                         dataIdx = b.getInt(
                                 CarrierConfigManager.KEY_WFC_DATA_SPN_FORMAT_IDX_INT);
+                        useRootLocale =
+                                b.getBoolean(CarrierConfigManager.KEY_WFC_SPN_USE_ROOT_LOCALE);
                     }
                 } catch (Exception e) {
                     loge("updateSpnDisplay: carrier config error: " + e);
                 }
+            }
+
+            String[] wfcSpnFormats = SubscriptionManager.getResourcesForSubId(mPhone.getContext(),
+                    mPhone.getSubId(), useRootLocale)
+                    .getStringArray(com.android.internal.R.array.wfcSpnFormats);
+
+            if (voiceIdx < 0 || voiceIdx >= wfcSpnFormats.length) {
+                loge("updateSpnDisplay: KEY_WFC_SPN_FORMAT_IDX_INT out of bounds: " + voiceIdx);
+                voiceIdx = 0;
+            }
+            if (dataIdx < 0 || dataIdx >= wfcSpnFormats.length) {
+                loge("updateSpnDisplay: KEY_WFC_DATA_SPN_FORMAT_IDX_INT out of bounds: " + dataIdx);
+                dataIdx = 0;
             }
 
             wfcVoiceSpnFormat = wfcSpnFormats[voiceIdx];
@@ -2685,7 +2702,7 @@ public class ServiceStateTracker extends Handler {
         switch (mCi.getRadioState()) {
             case RADIO_UNAVAILABLE:
                 mNewSS.setStateOutOfService();
-                mNewCellLoc.setStateInvalid();
+                mNewCellIdentity = null;
                 setSignalStrengthDefaultValues();
                 mNitzState.handleNetworkUnavailable();
                 pollStateDone();
@@ -2693,7 +2710,7 @@ public class ServiceStateTracker extends Handler {
 
             case RADIO_OFF:
                 mNewSS.setStateOff();
-                mNewCellLoc.setStateInvalid();
+                mNewCellIdentity = null;
                 setSignalStrengthDefaultValues();
                 mNitzState.handleNetworkUnavailable();
                 // don't poll when device is shutting down or the poll was not modemTrigged
@@ -2778,7 +2795,11 @@ public class ServiceStateTracker extends Handler {
         boolean hasVoiceRegStateChanged =
                 mSS.getVoiceRegState() != mNewSS.getVoiceRegState();
 
-        boolean hasLocationChanged = !mNewCellLoc.equals(mCellLoc);
+        // TODO: loosen this restriction to exempt fields that are provided through system
+        // information; otherwise, we will get false positives when things like the operator
+        // alphas are provided later - that's better than missing location changes, but
+        // still not ideal.
+        boolean hasLocationChanged = !Objects.equals(mNewCellIdentity, mCellIdentity);
 
         // ratchet the new tech up through its rat family but don't drop back down
         // until cell change or device is OOS
@@ -2869,9 +2890,7 @@ public class ServiceStateTracker extends Handler {
             // TODO: we may add filtering to reduce the event logged,
             // i.e. check preferred network setting, only switch to 2G, etc
             if (hasRilVoiceRadioTechnologyChanged) {
-                int cid = -1;
-                GsmCellLocation loc = (GsmCellLocation) mNewCellLoc;
-                if (loc != null) cid = loc.getCid();
+                int cid = getCidFromCellIdentity(mNewCellIdentity);
                 // NOTE: this code was previously located after mSS and mNewSS are swapped, so
                 // existing logs were incorrectly using the new state for "network_from"
                 // and STATE_OUT_OF_SERVICE for "network_to". To avoid confusion, use a new log tag
@@ -2898,7 +2917,7 @@ public class ServiceStateTracker extends Handler {
             mRejectCode = mNewRejectCode;
         }
 
-        ServiceState oldMergedSS = mPhone.getServiceState();
+        ServiceState oldMergedSS = new ServiceState(mPhone.getServiceState());
 
         // swap mSS and mNewSS to put new state in mSS
         ServiceState tss = mSS;
@@ -2907,10 +2926,10 @@ public class ServiceStateTracker extends Handler {
         // clean slate for next time
         mNewSS.setStateOutOfService();
 
-        // swap mCellLoc and mNewCellLoc to put new state in mCellLoc
-        CellLocation tcl = mCellLoc;
-        mCellLoc = mNewCellLoc;
-        mNewCellLoc = tcl;
+        // swap mCellIdentity and mNewCellIdentity to put new state in mCellIdentity
+        CellIdentity tempCellId = mCellIdentity;
+        mCellIdentity = mNewCellIdentity;
+        mNewCellIdentity = tempCellId;
 
         if (hasRilVoiceRadioTechnologyChanged) {
             updatePhoneObject();
@@ -2975,7 +2994,7 @@ public class ServiceStateTracker extends Handler {
                 // Passing empty string is important for the first update. The initial value of
                 // operator numeric in locale tracker is null. The async update will allow getting
                 // cell info from the modem instead of using the cached one.
-                mLocaleTracker.updateOperatorNumericAsync("");
+                mLocaleTracker.updateOperatorNumeric("");
                 mNitzState.handleNetworkUnavailable();
             } else if (mSS.getRilDataRadioTechnology() != ServiceState.RIL_RADIO_TECHNOLOGY_IWLAN) {
                 // If the device is on IWLAN, modems manufacture a ServiceState with the MCC/MNC of
@@ -2987,7 +3006,7 @@ public class ServiceStateTracker extends Handler {
                     setOperatorIdd(operatorNumeric);
                 }
 
-                mLocaleTracker.updateOperatorNumericSync(operatorNumeric);
+                mLocaleTracker.updateOperatorNumeric(operatorNumeric);
                 String countryIsoCode = mLocaleTracker.getCurrentCountry();
 
                 // Update Time Zone.
@@ -3052,6 +3071,10 @@ public class ServiceStateTracker extends Handler {
             notifySignalStrength();
         }
 
+        if (hasVoiceRegStateChanged || hasRilVoiceRadioTechnologyChanged) {
+            notifyVoiceRegStateRilRadioTechnologyChanged();
+        }
+
         if (hasDataRegStateChanged || hasRilDataRadioTechnologyChanged) {
             notifyDataRegStateRilRadioTechnologyChanged();
 
@@ -3084,7 +3107,7 @@ public class ServiceStateTracker extends Handler {
         }
 
         if (hasLocationChanged) {
-            mPhone.notifyLocationChanged();
+            mPhone.notifyLocationChanged(getCellLocation());
         }
 
         if (mPhone.isPhoneTypeGsm()) {
@@ -3493,75 +3516,77 @@ public class ServiceStateTracker extends Handler {
     }
 
     /**
-     * @param workSource calling WorkSource
-     * @return the current cell location information. Prefer Gsm location
-     * information if available otherwise return LTE location information
+     * Get CellLocation from the ServiceState if available or guess from cached CellInfo
+     *
+     * Get the CellLocation by first checking if ServiceState has a current CID. If so
+     * then return that info. Otherwise, check the latest List<CellInfo> and return the first GSM or
+     * WCDMA result that appears. If no GSM or WCDMA results, then return an LTE result. The
+     * behavior is kept consistent for backwards compatibility; (do not apply logic to determine
+     * why the behavior is this way).
+     *
+     * @return the current cell location if known or a non-null "empty" cell location
      */
-    public CellLocation getCellLocation(WorkSource workSource) {
-        if (((GsmCellLocation)mCellLoc).getLac() >= 0 &&
-                ((GsmCellLocation)mCellLoc).getCid() >= 0) {
-            if (VDBG) log("getCellLocation(): X good mCellLoc=" + mCellLoc);
-            return mCellLoc;
-        } else {
-            List<CellInfo> result = getAllCellInfo(workSource);
-            if (result != null) {
-                // A hack to allow tunneling of LTE information via GsmCellLocation
-                // so that older Network Location Providers can return some information
-                // on LTE only networks, see bug 9228974.
-                //
-                // We'll search the return CellInfo array preferring GSM/WCDMA
-                // data, but if there is none we'll tunnel the first LTE information
-                // in the list.
-                //
-                // The tunnel'd LTE information is returned as follows:
-                //   LAC = TAC field
-                //   CID = CI field
-                //   PSC = 0.
-                GsmCellLocation cellLocOther = new GsmCellLocation();
-                for (CellInfo ci : result) {
-                    if (ci instanceof CellInfoGsm) {
-                        CellInfoGsm cellInfoGsm = (CellInfoGsm)ci;
-                        CellIdentityGsm cellIdentityGsm = cellInfoGsm.getCellIdentity();
-                        cellLocOther.setLacAndCid(cellIdentityGsm.getLac(),
-                                cellIdentityGsm.getCid());
-                        cellLocOther.setPsc(cellIdentityGsm.getPsc());
-                        if (VDBG) log("getCellLocation(): X ret GSM info=" + cellLocOther);
-                        return cellLocOther;
-                    } else if (ci instanceof CellInfoWcdma) {
-                        CellInfoWcdma cellInfoWcdma = (CellInfoWcdma)ci;
-                        CellIdentityWcdma cellIdentityWcdma = cellInfoWcdma.getCellIdentity();
-                        cellLocOther.setLacAndCid(cellIdentityWcdma.getLac(),
-                                cellIdentityWcdma.getCid());
-                        cellLocOther.setPsc(cellIdentityWcdma.getPsc());
-                        if (VDBG) log("getCellLocation(): X ret WCDMA info=" + cellLocOther);
-                        return cellLocOther;
-                    } else if ((ci instanceof CellInfoLte) &&
-                            ((cellLocOther.getLac() < 0) || (cellLocOther.getCid() < 0))) {
-                        // We'll return the first good LTE info we get if there is no better answer
-                        CellInfoLte cellInfoLte = (CellInfoLte)ci;
-                        CellIdentityLte cellIdentityLte = cellInfoLte.getCellIdentity();
-                        if ((cellIdentityLte.getTac() != Integer.MAX_VALUE)
-                                && (cellIdentityLte.getCi() != Integer.MAX_VALUE)) {
-                            cellLocOther.setLacAndCid(cellIdentityLte.getTac(),
-                                    cellIdentityLte.getCi());
-                            cellLocOther.setPsc(0);
-                            if (VDBG) {
-                                log("getCellLocation(): possible LTE cellLocOther=" + cellLocOther);
-                            }
-                        }
-                    }
+    public CellLocation getCellLocation() {
+        if (mCellIdentity != null) return mCellIdentity.asCellLocation();
+
+        CellLocation cl = getCellLocationFromCellInfo(getAllCellInfo());
+        if (cl != null) return cl;
+
+        return mPhone.getPhoneType() == PhoneConstants.PHONE_TYPE_CDMA
+                ? new CdmaCellLocation() : new GsmCellLocation();
+    }
+
+    /**
+     * Get CellLocation from the ServiceState if available or guess from CellInfo
+     *
+     * Get the CellLocation by first checking if ServiceState has a current CID. If so
+     * then return that info. Otherwise, query AllCellInfo and return the first GSM or
+     * WCDMA result that appears. If no GSM or WCDMA results, then return an LTE result.
+     * The behavior is kept consistent for backwards compatibility; (do not apply logic
+     * to determine why the behavior is this way).
+     *
+     * @param workSource calling WorkSource
+     * @param rspMsg the response message which must be non-null
+     */
+    public void requestCellLocation(WorkSource workSource, Message rspMsg) {
+        if (mCellIdentity != null) {
+            AsyncResult.forMessage(rspMsg, mCellIdentity.asCellLocation(), null);
+            rspMsg.sendToTarget();
+            return;
+        }
+
+        Message cellLocRsp = obtainMessage(EVENT_CELL_LOCATION_RESPONSE, rspMsg);
+        requestAllCellInfo(workSource, cellLocRsp);
+    }
+
+    /* Find and return a CellLocation from CellInfo
+     *
+     * This method returns the first GSM or WCDMA result that appears in List<CellInfo>. If no GSM
+     * or  WCDMA results are found, then it returns an LTE result. The behavior is kept consistent
+     * for backwards compatibility; (do not apply logic to determine why the behavior is this way).
+     *
+     * @return the current cell location from CellInfo or null
+     */
+    private static CellLocation getCellLocationFromCellInfo(List<CellInfo> info) {
+        CellLocation cl = null;
+        if (info != null && info.size() > 0) {
+            CellIdentity fallbackLteCid = null; // We prefer not to use LTE
+            for (CellInfo ci : info) {
+                CellIdentity c = ci.getCellIdentity();
+                if (c instanceof CellIdentityLte && fallbackLteCid == null) {
+                    if (getCidFromCellIdentity(c) != -1) fallbackLteCid = c;
+                    continue;
                 }
-                if (VDBG) {
-                    log("getCellLocation(): X ret best answer cellLocOther=" + cellLocOther);
+                if (getCidFromCellIdentity(c) != -1) {
+                    cl = c.asCellLocation();
+                    break;
                 }
-                return cellLocOther;
-            } else {
-                if (VDBG) {
-                    log("getCellLocation(): X empty mCellLoc and CellInfo mCellLoc=" + mCellLoc);
-                }
-                return mCellLoc;
+            }
+            if (cl == null && fallbackLteCid != null) {
+                cl = fallbackLteCid.asCellLocation();
             }
         }
+        return cl;
     }
 
     /**
@@ -3874,6 +3899,25 @@ public class ServiceStateTracker extends Handler {
     }
 
     /**
+     * Registration for RIL Voice Radio Technology changing. The
+     * new radio technology will be returned AsyncResult#result as an Integer Object.
+     * The AsyncResult will be in the notification Message#obj.
+     *
+     * @param h handler to notify
+     * @param what what code of message when delivered
+     * @param obj placed in Message.obj
+     */
+    public void registerForVoiceRegStateOrRatChanged(Handler h, int what, Object obj) {
+        Registrant r = new Registrant(h, what, obj);
+        mVoiceRegStateOrRatChangedRegistrants.add(r);
+        notifyVoiceRegStateRilRadioTechnologyChanged();
+    }
+
+    public void unregisterForVoiceRegStateOrRatChanged(Handler h) {
+        mVoiceRegStateOrRatChangedRegistrants.remove(h);
+    }
+
+    /**
      * Registration for DataConnection RIL Data Radio Technology changing. The
      * new radio technology will be returned AsyncResult#result as an Integer Object.
      * The AsyncResult will be in the notification Message#obj.
@@ -4012,16 +4056,16 @@ public class ServiceStateTracker extends Handler {
                         mPhone.mCT.mBackgroundCall.hangupIfAlive();
                         mPhone.mCT.mForegroundCall.hangupIfAlive();
                     }
-                    dcTracker.cleanUpAllConnections(Phone.REASON_RADIO_TURNED_OFF);
-                    if (dds != mPhone.getSubId()
-                            && !ProxyController.getInstance().isDataDisconnected(dds)) {
-                        if (DBG) log("Data is active on DDS.  Wait for all data disconnect");
-                        // Data is not disconnected on DDS. Wait for the data disconnect complete
+                    if (!ProxyController.getInstance().isDataDisconnected(mPhone.getSubId())) {
+                        if (DBG) log("Wait for all data disconnect");
+                        // Data is not disconnected. Wait for the data disconnect complete
                         // before sending the RADIO_POWER off.
-                        ProxyController.getInstance().registerForAllDataDisconnected(dds, this,
-                                EVENT_ALL_DATA_DISCONNECTED, null);
+                        ProxyController.getInstance().registerForAllDataDisconnected(
+                                mPhone.getSubId(), this, EVENT_ALL_DATA_DISCONNECTED, null);
                         mPendingRadioPowerOffAfterDataOff = true;
                     }
+                    dcTracker.cleanUpAllConnections(Phone.REASON_RADIO_TURNED_OFF);
+
                     Message msg = Message.obtain(this);
                     msg.what = EVENT_SET_RADIO_POWER_OFF;
                     msg.arg1 = ++mPendingRadioPowerOffAfterDataOffTag;
@@ -4283,48 +4327,59 @@ public class ServiceStateTracker extends Handler {
         return TelephonyManager.getTelephonyProperty(mPhone.getPhoneId(), property, defValue);
     }
 
+    public List<CellInfo> getAllCellInfo() {
+        return mLastCellInfoList;
+    }
+
     /**
-     * @return all available cell information or null if none.
+     * Request the latest CellInfo from the modem.
+     *
+     * If sufficient time has elapsed, then this request will be sent to the modem. Otherwise
+     * the latest cached List<CellInfo> will be returned.
+     *
+     * @param workSource of the caller for power accounting
+     * @param rspMsg an optional response message to get the response to the CellInfo request. If
+     *     the rspMsg is not provided, then CellInfo will still be requested from the modem and
+     *     cached locally for future lookup.
      */
-    public List<CellInfo> getAllCellInfo(WorkSource workSource) {
-        CellInfoResult result = new CellInfoResult();
-        if (VDBG) log("SST.getAllCellInfo(): E");
-        int ver = mCi.getRilVersion();
-        if (ver >= 8) {
-            if (isCallerOnDifferentThread()) {
-                if ((SystemClock.elapsedRealtime() - mLastCellInfoListTime)
-                        > LAST_CELL_INFO_LIST_MAX_AGE_MS) {
-                    Message msg = obtainMessage(EVENT_GET_CELL_INFO_LIST, result);
-                    synchronized(result.lockObj) {
-                        result.list = null;
-                        mCi.getCellInfoList(msg, workSource);
-                        try {
-                            result.lockObj.wait(5000);
-                        } catch (InterruptedException e) {
-                            e.printStackTrace();
-                        }
-                    }
-                } else {
-                    if (DBG) log("SST.getAllCellInfo(): return last, back to back calls");
-                    result.list = mLastCellInfoList;
-                }
-            } else {
-                if (DBG) log("SST.getAllCellInfo(): return last, same thread can't block");
-                result.list = mLastCellInfoList;
-            }
-        } else {
-            if (DBG) log("SST.getAllCellInfo(): not implemented");
-            result.list = null;
+    public void requestAllCellInfo(WorkSource workSource, Message rspMsg) {
+        if (VDBG) log("SST.requestAllCellInfo(): E");
+        if (mCi.getRilVersion() < 8) {
+            if (DBG) log("SST.requestAllCellInfo(): not implemented");
+            return;
         }
-        synchronized(result.lockObj) {
-            if (result.list != null) {
-                if (VDBG) log("SST.getAllCellInfo(): X size=" + result.list.size()
-                        + " list=" + result.list);
-                return result.list;
-            } else {
-                if (DBG) log("SST.getAllCellInfo(): X size=0 list=null");
-                return null;
+        synchronized (mPendingCellInfoRequests) {
+            // If there are pending requests, then we already have a request active, so add this
+            // request to the response queue without initiating a new request.
+            if (mIsPendingCellInfoRequest) {
+                if (rspMsg != null) mPendingCellInfoRequests.add(rspMsg);
+                return;
             }
+            // Check to see whether the elapsed time is sufficient for a new request; if not, then
+            // return the result of the last request (if expected).
+            final long curTime = SystemClock.elapsedRealtime();
+            if ((curTime - mLastCellInfoReqTime) < LAST_CELL_INFO_LIST_MAX_AGE_MS) {
+                if (rspMsg != null) {
+                    if (DBG) log("SST.requestAllCellInfo(): return last, back to back calls");
+                    AsyncResult.forMessage(rspMsg, mLastCellInfoList, null);
+                    rspMsg.sendToTarget();
+                }
+                return;
+            }
+            // If this request needs an explicit response (it's a synchronous request), then queue
+            // the response message.
+            if (rspMsg != null) mPendingCellInfoRequests.add(rspMsg);
+            // Update the timeout window so that we don't delay based on slow responses
+            mLastCellInfoReqTime = curTime;
+            // Set a flag to remember that we have a pending cell info request
+            mIsPendingCellInfoRequest = true;
+            // Send a cell info request and also chase it with a timeout message
+            Message msg = obtainMessage(EVENT_GET_CELL_INFO_LIST);
+            mCi.getCellInfoList(msg, workSource);
+            // This message will arrive TIMEOUT ms later and ensure that we don't wait forever for
+            // a CELL_INFO response.
+            sendMessageDelayed(
+                    obtainMessage(EVENT_GET_CELL_INFO_LIST), CELL_INFO_LIST_QUERY_TIMEOUT);
         }
     }
 
@@ -4435,9 +4490,9 @@ public class ServiceStateTracker extends Handler {
         pw.println(" mRestrictedState=" + mRestrictedState);
         pw.println(" mPendingRadioPowerOffAfterDataOff=" + mPendingRadioPowerOffAfterDataOff);
         pw.println(" mPendingRadioPowerOffAfterDataOffTag=" + mPendingRadioPowerOffAfterDataOffTag);
-        pw.println(" mCellLoc=" + Rlog.pii(VDBG, mCellLoc));
-        pw.println(" mNewCellLoc=" + Rlog.pii(VDBG, mNewCellLoc));
-        pw.println(" mLastCellInfoListTime=" + mLastCellInfoListTime);
+        pw.println(" mCellIdentity=" + Rlog.pii(VDBG, mCellIdentity));
+        pw.println(" mNewCellIdentity=" + Rlog.pii(VDBG, mNewCellIdentity));
+        pw.println(" mLastCellInfoReqTime=" + mLastCellInfoReqTime);
         dumpCellInfoList(pw);
         pw.flush();
         pw.println(" mPreferredNetworkType=" + mPreferredNetworkType);

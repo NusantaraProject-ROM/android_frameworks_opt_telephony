@@ -1111,6 +1111,8 @@ public interface CommandsInterface {
      */
     void sendCdmaSms(byte[] pdu, Message response);
 
+    void sendCdmaSms(byte[] pdu, Message response, boolean expectMore);
+
     /**
      * send SMS over IMS with 3GPP/GSM SMS format
      * @param smscPDU is smsc address in PDU form GSM BCD format prefixed
@@ -1895,8 +1897,9 @@ public interface CommandsInterface {
      *
      * @param itemID the ID of the item to read
      * @param response callback message with the String response in the obj field
+     * @param workSource calling WorkSource
      */
-    void nvReadItem(int itemID, Message response);
+    default void nvReadItem(int itemID, Message response, WorkSource workSource) {}
 
     /**
      * Write one of the NV items defined in {@link RadioNVItems} / {@code ril_nv_items.h}.
@@ -1905,8 +1908,10 @@ public interface CommandsInterface {
      * @param itemID the ID of the item to read
      * @param itemValue the value to write, as a String
      * @param response Callback message.
+     * @param workSource calling WorkSource
      */
-    void nvWriteItem(int itemID, String itemValue, Message response);
+    default void nvWriteItem(int itemID, String itemValue, Message response,
+            WorkSource workSource) {}
 
     /**
      * Update the CDMA Preferred Roaming List (PRL) in the radio NV storage.
@@ -2059,23 +2064,27 @@ public interface CommandsInterface {
      * Get modem activity info and stats
      *
      * @param result Callback message contains the modem activity information
+     * @param workSource calling WorkSource
      */
-    public void getModemActivityInfo(Message result);
+    default void getModemActivityInfo(Message result, WorkSource workSource) {}
 
     /**
      * Set allowed carriers
      *
      * @param carriers Allowed carriers
      * @param result Callback message contains the number of carriers set successfully
+     * @param workSource calling WorkSource
      */
-    public void setAllowedCarriers(List<CarrierIdentifier> carriers, Message result);
+    default void setAllowedCarriers(List<CarrierIdentifier> carriers, Message result,
+            WorkSource workSource) {}
 
     /**
      * Get allowed carriers
      *
      * @param result Callback message contains the allowed carriers
+     * @param workSource calling WorkSource
      */
-    public void getAllowedCarriers(Message result);
+    default void getAllowedCarriers(Message result, WorkSource workSource) {}
 
     /**
      * Register for unsolicited PCO data.  This information is carrier-specific,
@@ -2167,8 +2176,9 @@ public interface CommandsInterface {
      * - {@link android.telephony.TelephonyManager#CARD_POWER_UP}
      * - {@link android.telephony.TelephonyManager#CARD_POWER_UP_PASS_THROUGH}
      * @param result callback message contains the information of SUCCESS/FAILURE
+     * @param workSource calling WorkSource
      */
-    void setSimCardPower(int state, Message result);
+    default void setSimCardPower(int state, Message result, WorkSource workSource) {}
 
     /**
      * Register for unsolicited Carrier Public Key.

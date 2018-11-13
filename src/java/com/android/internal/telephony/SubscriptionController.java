@@ -92,8 +92,14 @@ public class SubscriptionController extends ISub.Stub {
     private static final int DEPRECATED_SETTING = -1;
     private ScLocalLog mLocalLog = new ScLocalLog(MAX_LOCAL_LOG_LINES);
 
+    // Lock that both mCacheActiveSubInfoList and mCacheOpportunisticSubInfoList use.
+    private Object mSubInfoListLock = new Object();
+
     /* The Cache of Active SubInfoRecord(s) list of currently in use SubInfoRecord(s) */
     private final List<SubscriptionInfo> mCacheActiveSubInfoList = new ArrayList<>();
+
+    /* Similar to mCacheActiveSubInfoList but only caching opportunistic subscriptions. */
+    private List<SubscriptionInfo> mCacheOpportunisticSubInfoList = new ArrayList<>();
 
     /**
      * Copied from android.util.LocalLog with flush() adding flush and line number
@@ -151,18 +157,18 @@ public class SubscriptionController extends ISub.Stub {
     protected static Phone[] sPhones;
     protected Context mContext;
     protected TelephonyManager mTelephonyManager;
-    protected CallManager mCM;
 
     private AppOpsManager mAppOps;
 
     // FIXME: Does not allow for multiple subs in a slot and change to SparseArray
     private static Map<Integer, Integer> sSlotIndexToSubId =
             new ConcurrentHashMap<Integer, Integer>();
-    protected static int mDefaultFallbackSubId = SubscriptionManager.INVALID_SUBSCRIPTION_ID;
-    protected static int mDefaultPhoneId = SubscriptionManager.DEFAULT_PHONE_INDEX;
+    protected  static int mDefaultFallbackSubId = SubscriptionManager.INVALID_SUBSCRIPTION_ID;
+    protected  static int mDefaultPhoneId = SubscriptionManager.DEFAULT_PHONE_INDEX;
 
     private int[] colorArr;
     private long mLastISubServiceRegTime;
+    private int mPreferredDataSubId = SubscriptionManager.INVALID_SUBSCRIPTION_ID;
 
     public static SubscriptionController init(Phone phone) {
         synchronized (SubscriptionController.class) {
@@ -202,7 +208,6 @@ public class SubscriptionController extends ISub.Stub {
 
     protected void init(Context c) {
         mContext = c;
-        mCM = CallManager.getInstance();
         mTelephonyManager = TelephonyManager.from(mContext);
 
         mAppOps = (AppOpsManager)mContext.getSystemService(Context.APP_OPS_SERVICE);
@@ -221,7 +226,6 @@ public class SubscriptionController extends ISub.Stub {
 
     private SubscriptionController(Phone phone) {
         mContext = phone.getContext();
-        mCM = CallManager.getInstance();
         mAppOps = mContext.getSystemService(AppOpsManager.class);
 
         if(ServiceManager.getService("isub") == null) {
@@ -630,39 +634,7 @@ public class SubscriptionController extends ISub.Stub {
      */
     @Override
     public List<SubscriptionInfo> getActiveSubscriptionInfoList(String callingPackage) {
-        if (!isSubInfoReady()) {
-            if (DBG) logdl("[getActiveSubInfoList] Sub Controller not ready");
-            return null;
-        }
-
-        boolean canReadAllPhoneState;
-        try {
-            canReadAllPhoneState = TelephonyPermissions.checkReadPhoneState(mContext,
-                    SubscriptionManager.INVALID_SUBSCRIPTION_ID, Binder.getCallingPid(),
-                    Binder.getCallingUid(), callingPackage, "getActiveSubscriptionInfoList");
-        } catch (SecurityException e) {
-            canReadAllPhoneState = false;
-        }
-
-        synchronized (mCacheActiveSubInfoList) {
-            // If the caller can read all phone state, just return the full list.
-            if (canReadAllPhoneState) {
-                return new ArrayList<>(mCacheActiveSubInfoList);
-            }
-
-            // Filter the list to only include subscriptions which the caller can manage.
-            return mCacheActiveSubInfoList.stream()
-                    .filter(subscriptionInfo -> {
-                        try {
-                            return TelephonyPermissions.checkCallingOrSelfReadPhoneState(mContext,
-                                    subscriptionInfo.getSubscriptionId(), callingPackage,
-                                    "getActiveSubscriptionInfoList");
-                        } catch (SecurityException e) {
-                            return false;
-                        }
-                    })
-                    .collect(Collectors.toList());
-        }
+        return getSubscriptionInfoListFromCacheHelper(callingPackage, mCacheActiveSubInfoList);
     }
 
     /**
@@ -678,13 +650,20 @@ public class SubscriptionController extends ISub.Stub {
             return;
         }
 
-        synchronized (mCacheActiveSubInfoList) {
+        boolean opptSubListChanged = false;
+
+        synchronized (mSubInfoListLock) {
             mCacheActiveSubInfoList.clear();
             List<SubscriptionInfo> activeSubscriptionInfoList = getSubInfo(
                     SubscriptionManager.SIM_SLOT_INDEX + ">=0", null);
             if (activeSubscriptionInfoList != null) {
+                activeSubscriptionInfoList.sort(SUBSCRIPTION_INFO_COMPARATOR);
                 mCacheActiveSubInfoList.addAll(activeSubscriptionInfoList);
             }
+
+            // Refresh cached opportunistic sub list and detect whether it's changed.
+            opptSubListChanged = refreshCachedOpportunisticSubscriptionInfoList();
+
             if (DBG_CACHE) {
                 if (!mCacheActiveSubInfoList.isEmpty()) {
                     for (SubscriptionInfo si : mCacheActiveSubInfoList) {
@@ -695,6 +674,11 @@ public class SubscriptionController extends ISub.Stub {
                     logdl("[refreshCachedActiveSubscriptionInfoList]- no info return");
                 }
             }
+        }
+
+        // Send notification outside synchronization.
+        if (opptSubListChanged) {
+            notifyOpportunisticSubscriptionInfoChanged();
         }
     }
 
@@ -926,6 +910,19 @@ public class SubscriptionController extends ISub.Stub {
      */
     @Override
     public int addSubInfoRecord(String iccId, int slotIndex) {
+        String fullIccId;
+        Phone phone = PhoneFactory.getPhone(slotIndex);
+        UiccCard uiccCard = UiccController.getInstance().getUiccCardForSlot(slotIndex);
+        if (phone != null && uiccCard != null) {
+            fullIccId = phone.getFullIccSerialNumber();
+            if (TextUtils.isEmpty(fullIccId)) {
+                fullIccId = iccId;
+            }
+        } else {
+            if (DBG) logdl("[addSubInfoRecord]- null fullIccId");
+            return -1;
+        }
+
         if (DBG) logdl("[addSubInfoRecord]+ iccId:" + SubscriptionInfo.givePrintableIccid(iccId) +
                 " slotIndex:" + slotIndex);
 
@@ -944,8 +941,10 @@ public class SubscriptionController extends ISub.Stub {
                     new String[]{SubscriptionManager.UNIQUE_KEY_SUBSCRIPTION_ID,
                             SubscriptionManager.SIM_SLOT_INDEX, SubscriptionManager.NAME_SOURCE,
                             SubscriptionManager.ICC_ID, SubscriptionManager.CARD_ID},
-                    SubscriptionManager.ICC_ID + "=?" + " OR " + SubscriptionManager.ICC_ID + "=?",
-                            new String[]{iccId, IccUtils.getDecimalSubstring(iccId)}, null);
+                    SubscriptionManager.ICC_ID + "=?" + " OR " + SubscriptionManager.ICC_ID + "=?"
+                             + " OR " + SubscriptionManager.ICC_ID + "=?" + " collate nocase",
+                            new String[]{iccId, IccUtils.getDecimalSubstring(iccId), fullIccId},
+                            null);
 
             boolean setDisplayName = false;
             try {
@@ -969,8 +968,9 @@ public class SubscriptionController extends ISub.Stub {
                         setDisplayName = true;
                     }
 
-                    if (oldIccId != null && oldIccId.length() < iccId.length()
-                            && (oldIccId.equals(IccUtils.getDecimalSubstring(iccId)))) {
+                    if (oldIccId != null && oldIccId.length() != iccId.length()
+                           && (oldIccId.equals(IccUtils.getDecimalSubstring(iccId))
+                           || iccId.equalsIgnoreCase(IccUtils.stripTrailingFs(oldIccId)))) {
                         value.put(SubscriptionManager.ICC_ID, iccId);
                     }
 
@@ -1720,6 +1720,7 @@ public class SubscriptionController extends ISub.Stub {
         intent.addFlags(Intent.FLAG_RECEIVER_REPLACE_PENDING
                 | Intent.FLAG_RECEIVER_INCLUDE_BACKGROUND);
         intent.putExtra(PhoneConstants.SUBSCRIPTION_KEY, subId);
+        intent.putExtra(SubscriptionManager.EXTRA_SUBSCRIPTION_INDEX, subId);
         mContext.sendStickyBroadcastAsUser(intent, UserHandle.ALL);
     }
 
@@ -1804,6 +1805,7 @@ public class SubscriptionController extends ISub.Stub {
         intent.addFlags(Intent.FLAG_RECEIVER_REPLACE_PENDING
                 | Intent.FLAG_RECEIVER_INCLUDE_BACKGROUND);
         intent.putExtra(PhoneConstants.SUBSCRIPTION_KEY, subId);
+        intent.putExtra(SubscriptionManager.EXTRA_SUBSCRIPTION_INDEX, subId);
         mContext.sendStickyBroadcastAsUser(intent, UserHandle.ALL);
     }
 
@@ -1985,6 +1987,20 @@ public class SubscriptionController extends ISub.Stub {
     }
 
     @Override
+    public boolean isActiveSubId(int subId, String callingPackage) {
+        if (!TelephonyPermissions.checkCallingOrSelfReadPhoneState(mContext, subId, callingPackage,
+              "isActiveSubId")) {
+            throw new SecurityException("Requires READ_PHONE_STATE permission.");
+        }
+        final long identity = Binder.clearCallingIdentity();
+        try {
+            return isActiveSubId(subId);
+        } finally {
+            Binder.restoreCallingIdentity(identity);
+        }
+    }
+
+    @Deprecated // This should be moved into isActiveSubId(int, String)
     public boolean isActiveSubId(int subId) {
         boolean retVal = SubscriptionManager.isValidSubscriptionId(subId)
                 && sSlotIndexToSubId.containsValue(subId);
@@ -2332,35 +2348,113 @@ public class SubscriptionController extends ISub.Stub {
 
     @Override
     public int setPreferredData(int slotId) {
-        // TODO: send to phone switcher.
-        return 0;
+        enforceModifyPhoneState("setPreferredData");
+        final long token = Binder.clearCallingIdentity();
+
+        try {
+            // TODO: make this API takes in subId directly.
+            int subId = getSubIdUsingPhoneId(slotId);
+
+            if (mPreferredDataSubId != subId) {
+                mPreferredDataSubId = subId;
+                PhoneSwitcher.getInstance().setPreferredData(subId);
+                notifyPreferredDataSubIdChanged();
+            }
+
+            return 0;
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
+    }
+
+    private void notifyPreferredDataSubIdChanged() {
+        ITelephonyRegistry tr = ITelephonyRegistry.Stub.asInterface(ServiceManager.getService(
+                "telephony.registry"));
+        try {
+            if (DBG) logd("notifyPreferredDataSubIdChanged:");
+            tr.notifyPreferredDataSubIdChanged(mPreferredDataSubId);
+        } catch (RemoteException ex) {
+            // Should never happen because its always available.
+        }
     }
 
     @Override
     public List<SubscriptionInfo> getOpportunisticSubscriptions(int slotId, String callingPackage) {
-        if (!TelephonyPermissions.checkCallingOrSelfReadPhoneState(mContext,
-                SubscriptionManager.INVALID_SUBSCRIPTION_ID, callingPackage,
-                "getOpportunisticSubscriptions")) {
+        return getSubscriptionInfoListFromCacheHelper(
+                callingPackage, mCacheOpportunisticSubInfoList);
+    }
+
+    // Helper function of getOpportunisticSubscriptions and getActiveSubscriptionInfoList.
+    // They are doing similar things except operating on different cache.
+    private List<SubscriptionInfo> getSubscriptionInfoListFromCacheHelper(
+            String callingPackage, List<SubscriptionInfo> cacheSubList) {
+        if (!isSubInfoReady()) {
+            if (DBG) logdl("[getSubscriptionInfoList] Sub Controller not ready");
             return null;
         }
 
-        final long token = Binder.clearCallingIdentity();
-
+        boolean canReadAllPhoneState;
         try {
-            List<SubscriptionInfo> activeSubList = getActiveSubscriptionInfoList(callingPackage);
-            List<SubscriptionInfo> opportunisticSubList = new ArrayList<>();
+            canReadAllPhoneState = TelephonyPermissions.checkReadPhoneState(mContext,
+                    SubscriptionManager.INVALID_SUBSCRIPTION_ID, Binder.getCallingPid(),
+                    Binder.getCallingUid(), callingPackage, "getSubscriptionInfoList");
+        } catch (SecurityException e) {
+            canReadAllPhoneState = false;
+        }
 
-            if (activeSubList != null) {
-                for (SubscriptionInfo subInfo : activeSubList) {
-                    if (subInfo.isOpportunistic() && subInfo.getSimSlotIndex() == slotId) {
-                        opportunisticSubList.add(subInfo);
+        synchronized (mSubInfoListLock) {
+            // If the caller can read all phone state, just return the full list.
+            if (canReadAllPhoneState) {
+                return new ArrayList<>(cacheSubList);
+            }
+
+            // Filter the list to only include subscriptions which the caller can manage.
+            return cacheSubList.stream()
+                    .filter(subscriptionInfo -> {
+                        try {
+                            return TelephonyPermissions.checkCallingOrSelfReadPhoneState(mContext,
+                                    subscriptionInfo.getSubscriptionId(), callingPackage,
+                                    "getOpportunisticSubscriptions");
+                        } catch (SecurityException e) {
+                            return false;
+                        }
+                    })
+                    .collect(Collectors.toList());
+        }
+    }
+
+    private void notifyOpportunisticSubscriptionInfoChanged() {
+        ITelephonyRegistry tr = ITelephonyRegistry.Stub.asInterface(ServiceManager.getService(
+                "telephony.registry"));
+        try {
+            if (DBG) logd("notifyOpptSubscriptionInfoChanged:");
+            tr.notifyOpportunisticSubscriptionInfoChanged();
+        } catch (RemoteException ex) {
+            // Should never happen because its always available.
+        }
+    }
+
+
+    private boolean refreshCachedOpportunisticSubscriptionInfoList() {
+        synchronized (mSubInfoListLock) {
+            List<SubscriptionInfo> oldOpptCachedList = mCacheOpportunisticSubInfoList;
+
+            mCacheOpportunisticSubInfoList = mCacheActiveSubInfoList.stream()
+                    .filter(subscriptionInfo -> subscriptionInfo.isOpportunistic())
+                    .collect(Collectors.toList());
+
+            if (DBG_CACHE) {
+                if (!mCacheOpportunisticSubInfoList.isEmpty()) {
+                    for (SubscriptionInfo si : mCacheOpportunisticSubInfoList) {
+                        logd("[refreshCachedOpptSubscriptionInfoList] Setting Cached info="
+                                + si);
                     }
+                } else {
+                    logdl("[refreshCachedOpptSubscriptionInfoList]- no info return");
                 }
             }
 
-            return opportunisticSubList;
-        } finally {
-            Binder.restoreCallingIdentity(token);
+            return !oldOpptCachedList.equals(mCacheOpportunisticSubInfoList);
         }
     }
 }
