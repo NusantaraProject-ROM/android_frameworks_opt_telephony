@@ -45,6 +45,8 @@ import android.telephony.Rlog;
 import android.telephony.ServiceState;
 import android.telephony.SmsManager;
 import android.telephony.SmsMessage;
+import android.telephony.SubscriptionInfo;
+import android.telephony.SubscriptionManager;
 import android.telephony.TelephonyHistogram;
 import android.telephony.TelephonyManager;
 import android.telephony.data.DataCallResponse;
@@ -69,10 +71,12 @@ import com.android.internal.telephony.SmsResponse;
 import com.android.internal.telephony.UUSInfo;
 import com.android.internal.telephony.imsphone.ImsPhoneCall;
 import com.android.internal.telephony.nano.TelephonyProto;
+import com.android.internal.telephony.nano.TelephonyProto.ActiveSubscriptionInfo;
 import com.android.internal.telephony.nano.TelephonyProto.ImsCapabilities;
 import com.android.internal.telephony.nano.TelephonyProto.ImsConnectionState;
 import com.android.internal.telephony.nano.TelephonyProto.ModemPowerStats;
 import com.android.internal.telephony.nano.TelephonyProto.RilDataCall;
+import com.android.internal.telephony.nano.TelephonyProto.SimState;
 import com.android.internal.telephony.nano.TelephonyProto.SmsSession;
 import com.android.internal.telephony.nano.TelephonyProto.TelephonyCallSession;
 import com.android.internal.telephony.nano.TelephonyProto.TelephonyCallSession.Event.CallState;
@@ -82,7 +86,9 @@ import com.android.internal.telephony.nano.TelephonyProto.TelephonyEvent;
 import com.android.internal.telephony.nano.TelephonyProto.TelephonyEvent.CarrierIdMatching;
 import com.android.internal.telephony.nano.TelephonyProto.TelephonyEvent.CarrierIdMatchingResult;
 import com.android.internal.telephony.nano.TelephonyProto.TelephonyEvent.CarrierKeyChange;
+import com.android.internal.telephony.nano.TelephonyProto.TelephonyEvent.DataSwitch;
 import com.android.internal.telephony.nano.TelephonyProto.TelephonyEvent.ModemRestart;
+import com.android.internal.telephony.nano.TelephonyProto.TelephonyEvent.OnDemandDataSwitch;
 import com.android.internal.telephony.nano.TelephonyProto.TelephonyEvent.RilDeactivateDataCall;
 import com.android.internal.telephony.nano.TelephonyProto.TelephonyEvent.RilDeactivateDataCall.DeactivateReason;
 import com.android.internal.telephony.nano.TelephonyProto.TelephonyEvent.RilSetupDataCall;
@@ -96,6 +102,7 @@ import com.android.internal.util.IndentingPrintWriter;
 
 import java.io.FileDescriptor;
 import java.io.PrintWriter;
+import java.text.DecimalFormat;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -168,9 +175,34 @@ public class TelephonyMetrics {
     private final SparseArray<TelephonySettings> mLastSettings = new SparseArray<>();
 
     /**
+     * Last sim state, indexed by phone id.
+     */
+    private final SparseArray<Integer> mLastSimState = new SparseArray<>();
+
+    /**
+     * Last active subscription information, indexed by phone id.
+     */
+    private final SparseArray<ActiveSubscriptionInfo> mLastActiveSubscriptionInfos =
+            new SparseArray<>();
+
+    /**
+     * The last modem state represent by a bitmap, the i-th bit(LSB) indicates the i-th modem
+     * state(0 - disabled, 1 - enabled).
+     *
+     * TODO: initialize the enabled modem bitmap when it's possible to get the modem state.
+     */
+    private int mLastEnabledModemBitmap = (1 << TelephonyManager.getDefault().getPhoneCount()) - 1;
+
+    /**
      * Last carrier id matching.
      */
     private final SparseArray<CarrierIdMatching> mLastCarrierId = new SparseArray<>();
+
+    /**
+     * Last RilDataCall Events (indexed by cid), indexed by phone id
+     */
+    private final SparseArray<SparseArray<RilDataCall>> mLastRilDataCallEvents =
+            new SparseArray<>();
 
     /** The start system time of the TelephonyLog in milliseconds*/
     private long mStartSystemTimeMs;
@@ -182,7 +214,8 @@ public class TelephonyMetrics {
     private boolean mTelephonyEventsDropped = false;
 
     public TelephonyMetrics() {
-        reset();
+        mStartSystemTimeMs = System.currentTimeMillis();
+        mStartElapsedTimeMs = SystemClock.elapsedRealtime();
     }
 
     /**
@@ -509,6 +542,8 @@ public class TelephonyMetrics {
         pw.println("Amount of time phone spent in various cellular "
                 + "rx signal strength levels (ms): "
                 + Arrays.toString(s.timeInRxSignalStrengthLevelMs));
+        pw.println("Energy consumed across measured modem rails (mAh): "
+                + new DecimalFormat("#.##").format(s.monitoredRailEnergyConsumedMah));
         pw.decreaseIndent();
         pw.println("Hardware Version: " + SystemProperties.get("ro.boot.revision", ""));
     }
@@ -569,6 +604,29 @@ public class TelephonyMetrics {
                     .setCarrierIdMatching(mLastCarrierId.get(key)).build();
             addTelephonyEvent(event);
         }
+
+        for (int i = 0; i < mLastActiveSubscriptionInfos.size(); i++) {
+            final int key = mLastActiveSubscriptionInfos.keyAt(i);
+            TelephonyEvent event = new TelephonyEventBuilder(mStartElapsedTimeMs, key)
+                    .setActiveSubscriptionInfoChange(mLastActiveSubscriptionInfos.get(key)).build();
+            addTelephonyEvent(event);
+        }
+
+        for (int i = 0; i < mLastRilDataCallEvents.size(); i++) {
+            final int key = mLastRilDataCallEvents.keyAt(i);
+            for (int j = 0; j < mLastRilDataCallEvents.get(key).size(); j++) {
+                final int cidKey = mLastRilDataCallEvents.get(key).keyAt(j);
+                RilDataCall[] dataCalls = new RilDataCall[1];
+                dataCalls[0] = mLastRilDataCallEvents.get(key).get(cidKey);
+                addTelephonyEvent(new TelephonyEventBuilder(mStartElapsedTimeMs, key)
+                        .setDataCalls(dataCalls).build());
+            }
+        }
+        addTelephonyEvent(new TelephonyEventBuilder(mStartElapsedTimeMs, -1 /* phoneId */)
+                .setSimStateChange(mLastSimState).build());
+
+        addTelephonyEvent(new TelephonyEventBuilder(mStartElapsedTimeMs, -1 /* phoneId */)
+                .setEnabledModemBitmap(mLastEnabledModemBitmap).build());
     }
 
     /**
@@ -625,7 +683,69 @@ public class TelephonyMetrics {
         log.endTime = new TelephonyProto.Time();
         log.endTime.systemTimestampMillis = System.currentTimeMillis();
         log.endTime.elapsedTimestampMillis = SystemClock.elapsedRealtime();
+
+        // Log the last active subscription information.
+        ActiveSubscriptionInfo[] activeSubscriptionInfo =
+                new ActiveSubscriptionInfo[mLastActiveSubscriptionInfos.size()];
+        for (int i = 0; i < mLastActiveSubscriptionInfos.size(); i++) {
+            int key = mLastActiveSubscriptionInfos.keyAt(i);
+            activeSubscriptionInfo[key] = mLastActiveSubscriptionInfos.get(key);
+        }
+        log.lastActiveSubscriptionInfo = activeSubscriptionInfo;
+
         return log;
+    }
+
+    /** Update the sim state. */
+    public void updateSimState(int phoneId, int simState) {
+        int state = mapSimStateToProto(simState);
+        Integer lastSimState = mLastSimState.get(phoneId);
+        if (lastSimState == null || !lastSimState.equals(state)) {
+            mLastSimState.put(phoneId, state);
+            addTelephonyEvent(new TelephonyEventBuilder().setSimStateChange(mLastSimState).build());
+        }
+    }
+
+    /** Update active subscription info list. */
+    public void updateActiveSubscriptionInfoList(List<SubscriptionInfo> subInfos) {
+        List<Integer> inActivePhoneList = new ArrayList<>();
+        for (int i = 0; i < mLastActiveSubscriptionInfos.size(); i++) {
+            inActivePhoneList.add(mLastActiveSubscriptionInfos.keyAt(i));
+        }
+
+        for (SubscriptionInfo info : subInfos) {
+            int phoneId = SubscriptionManager.getPhoneId(info.getSubscriptionId());
+            inActivePhoneList.removeIf(value -> value.equals(phoneId));
+            ActiveSubscriptionInfo activeSubscriptionInfo = new ActiveSubscriptionInfo();
+            activeSubscriptionInfo.slotIndex = phoneId;
+            activeSubscriptionInfo.isOpportunistic = info.isOpportunistic() ? 1 : 0;
+            activeSubscriptionInfo.carrierId = info.getCarrierId();
+            if (isDifferentSubscriptionInfo(
+                    mLastActiveSubscriptionInfos.get(phoneId), activeSubscriptionInfo)) {
+                addTelephonyEvent(new TelephonyEventBuilder(phoneId)
+                        .setActiveSubscriptionInfoChange(activeSubscriptionInfo).build());
+
+                mLastActiveSubscriptionInfos.put(phoneId, activeSubscriptionInfo);
+            }
+        }
+
+        for (int phoneId : inActivePhoneList) {
+            mLastActiveSubscriptionInfos.remove(phoneId);
+            ActiveSubscriptionInfo invalidSubInfo = new ActiveSubscriptionInfo();
+            invalidSubInfo.slotIndex = phoneId;
+            invalidSubInfo.carrierId = -1;
+            invalidSubInfo.isOpportunistic = -1;
+            addTelephonyEvent(new TelephonyEventBuilder(phoneId)
+                    .setActiveSubscriptionInfoChange(invalidSubInfo).build());
+        }
+    }
+
+    /** Update the enabled modem bitmap. */
+    public void updateEnabledModemBitmap(int enabledModemBitmap) {
+        if (mLastEnabledModemBitmap == enabledModemBitmap) return;
+        mLastEnabledModemBitmap = enabledModemBitmap;
+        addTelephonyEvent(new TelephonyEventBuilder()
+                .setEnabledModemBitmap(mLastEnabledModemBitmap).build());
     }
 
     /**
@@ -1228,25 +1348,36 @@ public class TelephonyMetrics {
     }
 
     /**
-     * Write get data call list event
-     *
-     * @param phoneId Phone id
-     * @param dcsList Data call list
+     * Write data call list event when connected
+     * @param phoneId          Phone id
+     * @param cid              Context Id, uniquely identifies the call
+     * @param apnTypeBitmask   Bitmask of supported APN types
+     * @param state            State of the data call event
      */
-    public void writeRilDataCallList(int phoneId, ArrayList<DataCallResponse> dcsList) {
+    public void writeRilDataCallEvent(int phoneId, int cid,
+            int apnTypeBitmask, int state) {
+        RilDataCall[] dataCalls = new RilDataCall[1];
+        dataCalls[0] = new RilDataCall();
+        dataCalls[0].cid = cid;
+        dataCalls[0].apnTypeBitmask = apnTypeBitmask;
+        dataCalls[0].state = state;
 
-        RilDataCall[] dataCalls = new RilDataCall[dcsList.size()];
-
-        for (int i = 0; i < dcsList.size(); i++) {
-            dataCalls[i] = new RilDataCall();
-            dataCalls[i].cid = dcsList.get(i).getCallId();
-            if (!TextUtils.isEmpty(dcsList.get(i).getIfname())) {
-                dataCalls[i].iframe = dcsList.get(i).getIfname();
+        SparseArray<RilDataCall> dataCallList;
+        if (mLastRilDataCallEvents.get(phoneId) != null) {
+            // If the Data call event does not change, do not log it.
+            if (mLastRilDataCallEvents.get(phoneId).get(cid) != null
+                    && Arrays.equals(
+                        RilDataCall.toByteArray(mLastRilDataCallEvents.get(phoneId).get(cid)),
+                        RilDataCall.toByteArray(dataCalls[0]))) {
+                return;
             }
-
-            dataCalls[i].type = dcsList.get(i).getProtocolType() + 1;
+            dataCallList =  mLastRilDataCallEvents.get(phoneId);
+        } else {
+            dataCallList = new SparseArray<>();
         }
 
+        dataCallList.put(cid, dataCalls[0]);
+        mLastRilDataCallEvents.put(phoneId, dataCallList);
         addTelephonyEvent(new TelephonyEventBuilder(phoneId).setDataCalls(dataCalls).build());
     }
 
@@ -1626,6 +1757,32 @@ public class TelephonyMetrics {
                 writeOnSmsSolicitedResponse(phoneId, rilSerial, rilError, smsResponse);
                 break;
         }
+    }
+
+    /**
+     * Write network validation event.
+     * @param networkValidationState the network validation state.
+     */
+    public void writeNetworkValidate(int networkValidationState) {
+        addTelephonyEvent(
+                new TelephonyEventBuilder().setNetworkValidate(networkValidationState).build());
+    }
+
+    /**
+     * Write data switch event.
+     * @param dataSwitch the reason and state of data switch.
+     */
+    public void writeDataSwitch(DataSwitch dataSwitch) {
+        addTelephonyEvent(new TelephonyEventBuilder().setDataSwitch(dataSwitch).build());
+    }
+
+    /**
+     * Write on demand data switch event.
+     * @param onDemandDataSwitch the apn and state of on demand data switch.
+     */
+    public void writeOnDemandDataSwitch(OnDemandDataSwitch onDemandDataSwitch) {
+        addTelephonyEvent(
+                new TelephonyEventBuilder().setOnDemandDataSwitch(onDemandDataSwitch).build());
     }
 
     /**
@@ -2343,4 +2500,25 @@ public class TelephonyMetrics {
     public void writeOnImsCallResumeFailed(int phoneId, ImsCallSession session,
                                            ImsReasonInfo reasonInfo) {}
     public void writeOnRilTimeoutResponse(int phoneId, int rilSerial, int rilRequest) {}
+
+    private static int mapSimStateToProto(int simState) {
+        switch (simState) {
+            case TelephonyManager.SIM_STATE_ABSENT:
+                return SimState.SIM_STATE_ABSENT;
+            case TelephonyManager.SIM_STATE_LOADED:
+                return SimState.SIM_STATE_LOADED;
+            default:
+                return SimState.SIM_STATE_UNKNOWN;
+        }
+    }
+
+    private static boolean isDifferentSubscriptionInfo(
+            ActiveSubscriptionInfo oldInfo, ActiveSubscriptionInfo newInfo) {
+        if (oldInfo == null || newInfo == null) {
+            return oldInfo == newInfo;
+        }
+
+        return oldInfo.slotIndex != newInfo.slotIndex || oldInfo.carrierId != newInfo.carrierId
+                || oldInfo.isOpportunistic != newInfo.isOpportunistic;
+    }
 }

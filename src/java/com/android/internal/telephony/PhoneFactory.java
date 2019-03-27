@@ -27,6 +27,7 @@ import android.os.ServiceManager;
 import android.preference.PreferenceManager;
 import android.provider.Settings;
 import android.provider.Settings.SettingNotFoundException;
+import android.telephony.DebugEventReporter;
 import android.telephony.Rlog;
 import android.telephony.SubscriptionManager;
 import android.telephony.TelephonyManager;
@@ -193,11 +194,13 @@ public class PhoneFactory {
                     if (phoneType == PhoneConstants.PHONE_TYPE_GSM) {
                         phone = injectedComponentFactory.makePhone(context,
                                 sCommandsInterfaces[i], sPhoneNotifier, i,
-                                PhoneConstants.PHONE_TYPE_GSM, injectedComponentFactory);
+                                PhoneConstants.PHONE_TYPE_GSM,
+                                TelephonyComponentFactory.getInstance());
                     } else if (phoneType == PhoneConstants.PHONE_TYPE_CDMA) {
                         phone = injectedComponentFactory.makePhone(context,
                                 sCommandsInterfaces[i], sPhoneNotifier, i,
-                                PhoneConstants.PHONE_TYPE_CDMA_LTE, injectedComponentFactory);
+                                PhoneConstants.PHONE_TYPE_CDMA_LTE,
+                                TelephonyComponentFactory.getInstance());
                     }
                     Rlog.i(LOG_TAG, "Creating Phone with type = " + phoneType + " sub = " + i);
 
@@ -556,6 +559,16 @@ public class PhoneFactory {
         } catch (Exception e) {
             e.printStackTrace();
         }
+        pw.decreaseIndent();
+        pw.println("++++++++++++++++++++++++++++++++");
+        pw.println("DebugEvents:");
+        pw.increaseIndent();
+        try {
+            DebugEventReporter.dump(fd, pw, args);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+
         pw.flush();
         pw.decreaseIndent();
     }

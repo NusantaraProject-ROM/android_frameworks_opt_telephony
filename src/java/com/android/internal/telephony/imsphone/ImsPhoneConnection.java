@@ -263,6 +263,9 @@ public class ImsPhoneConnection extends Connection implements
         parent.attachFake(this, ImsPhoneCall.State.DIALING);
 
         mIsEmergency = isEmergency;
+        if (isEmergency) {
+            setEmergencyCallInfo();
+        }
 
         fetchDtmfToneDelay(phone);
 
@@ -301,7 +304,7 @@ public class ImsPhoneConnection extends Connection implements
                 capabilities = addCapability(capabilities,
                         Connection.Capability.SUPPORTS_VT_LOCAL_BIDIRECTIONAL);
                 break;
-            case ImsCallProfile.CALL_TYPE_UNKNOWN:
+            case ImsCallProfile.CALL_TYPE_VT_NODIR:
                 capabilities = removeCapability(capabilities,
                         Connection.Capability.SUPPORTS_DOWNGRADE_TO_VOICE_LOCAL);
                 break;
@@ -321,7 +324,7 @@ public class ImsPhoneConnection extends Connection implements
                 capabilities = addCapability(capabilities,
                         Connection.Capability.SUPPORTS_VT_REMOTE_BIDIRECTIONAL);
                 break;
-            case ImsCallProfile.CALL_TYPE_UNKNOWN:
+            case ImsCallProfile.CALL_TYPE_VT_NODIR:
                 capabilities = removeCapability(capabilities,
                         Connection.Capability.SUPPORTS_DOWNGRADE_TO_VOICE_REMOTE);
                 break;
@@ -1085,16 +1088,10 @@ public class ImsPhoneConnection extends Connection implements
         mRttTextHandler.sendToInCall(message);
     }
 
-    public void onCallSessionPropertyChanged(int property) {
-        Bundle extras = new Bundle();
-        extras.putInt(android.telecom.Connection.EXTRA_CALL_PROPERTY, property);
-        onConnectionEvent(android.telecom.Connection.EVENT_CALL_PROPERTY_CHANGED, extras);
-    }
-
     public void onRttAudioIndicatorChanged(ImsStreamMediaProfile profile) {
         Bundle extras = new Bundle();
         extras.putBoolean(android.telecom.Connection.EXTRA_IS_RTT_AUDIO_PRESENT,
-                profile.getRttAudioSpeech());
+                profile.isReceivingRttAudio());
         onConnectionEvent(android.telecom.Connection.EVENT_RTT_AUDIO_INDICATION_CHANGED,
                 extras);
     }

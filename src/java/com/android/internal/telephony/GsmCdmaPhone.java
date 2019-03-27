@@ -178,8 +178,6 @@ public class GsmCdmaPhone extends Phone {
     public EmergencyNumberTracker mEmergencyNumberTracker;
     private ArrayList <MmiCode> mPendingMMIs = new ArrayList<MmiCode>();
     private IccPhoneBookInterfaceManager mIccPhoneBookIntManager;
-    // Used for identify the carrier of current subscription
-    private CarrierResolver mCarrierResolver;
 
     private int mPrecisePhoneType;
 
@@ -446,6 +444,15 @@ public class GsmCdmaPhone extends Phone {
         mSST.updatePhoneType();
         setPhoneName(precisePhoneType == PhoneConstants.PHONE_TYPE_GSM ? "GSM" : "CDMA");
         onUpdateIccAvailability();
+        // if is possible that onUpdateIccAvailability() does not unregister and re-register for
+        // ICC events, for example if mUiccApplication does not change which can happen if phone
+        // type is transitioning from CDMA to GSM but 3gpp2 application was not available.
+        // To handle such cases, unregister and re-register here. They still need to be called in
+        // onUpdateIccAvailability(), since in normal cases register/unregister calls can be on
+        // different IccRecords objects. Here they are on the same IccRecords object.
+        unregisterForIccRecordEvents();
+        registerForIccRecordEvents();
+
         mCT.updatePhoneType();
 
         int radioState = mCi.getRadioState();
@@ -1302,9 +1309,9 @@ public class GsmCdmaPhone extends Phone {
             if (DBG) logd("dialInternal: dialing w/ mmi '" + mmi + "'...");
 
             if (mmi == null) {
-                return mCT.dial(newDialString, dialArgs.uusInfo, dialArgs.intentExtras);
+                return mCT.dialGsm(newDialString, dialArgs.uusInfo, dialArgs.intentExtras);
             } else if (mmi.isTemporaryModeCLIR()) {
-                return mCT.dial(mmi.mDialingNumber, mmi.getCLIRMode(), dialArgs.uusInfo,
+                return mCT.dialGsm(mmi.mDialingNumber, mmi.getCLIRMode(), dialArgs.uusInfo,
                         dialArgs.intentExtras);
             } else {
                 mPendingMMIs.add(mmi);
@@ -1313,7 +1320,7 @@ public class GsmCdmaPhone extends Phone {
                 return null;
             }
         } else {
-            return mCT.dial(newDialString);
+            return mCT.dial(newDialString, dialArgs.intentExtras);
         }
     }
 
@@ -1976,7 +1983,8 @@ public class GsmCdmaPhone extends Phone {
                 imsPhone.getCallBarring(facility, password, onComplete, serviceClass);
                 return;
             }
-            mCi.queryFacilityLock(facility, password, serviceClass, onComplete);
+            mCi.queryFacilityLock(facility, password,
+                    CommandsInterface.SERVICE_CLASS_NONE, onComplete);
         } else {
             loge("getCallBarringOption: not possible in CDMA");
         }
@@ -1991,7 +1999,8 @@ public class GsmCdmaPhone extends Phone {
                 imsPhone.setCallBarring(facility, lockState, password, onComplete, serviceClass);
                 return;
             }
-            mCi.setFacilityLock(facility, lockState, password, serviceClass, onComplete);
+            mCi.setFacilityLock(facility, lockState, password,
+                    CommandsInterface.SERVICE_CLASS_NONE, onComplete);
         } else {
             loge("setCallBarringOption: not possible in CDMA");
         }
