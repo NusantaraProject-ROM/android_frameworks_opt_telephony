@@ -16,21 +16,27 @@
 
 package com.android.internal.telephony.dataconnection;
 
-import android.annotation.IntDef;
 import android.annotation.NonNull;
+import android.annotation.Nullable;
+import android.annotation.StringDef;
 import android.os.AsyncResult;
 import android.os.Handler;
 import android.os.Message;
 import android.os.RegistrantList;
+import android.os.SystemProperties;
+import android.telephony.AccessNetworkConstants;
 import android.telephony.AccessNetworkConstants.AccessNetworkType;
-import android.telephony.AccessNetworkConstants.TransportType;
 import android.telephony.CarrierConfigManager;
 import android.telephony.Rlog;
 import android.telephony.data.ApnSetting;
 import android.telephony.data.ApnSetting.ApnType;
+import android.util.LocalLog;
+import android.util.SparseArray;
+import android.util.SparseIntArray;
 
 import com.android.internal.annotations.VisibleForTesting;
 import com.android.internal.telephony.Phone;
+import com.android.internal.telephony.RIL;
 import com.android.internal.telephony.dataconnection.AccessNetworksManager.QualifiedNetworks;
 import com.android.internal.util.ArrayUtils;
 import com.android.internal.util.IndentingPrintWriter;
@@ -48,8 +54,43 @@ import java.util.stream.Collectors;
 
 /**
  * This class represents the transport manager which manages available transports (i.e. WWAN or
- * WLAN)and determine the correct transport for {@link TelephonyNetworkFactory} to handle the data
+ * WLAN) and determine the correct transport for {@link TelephonyNetworkFactory} to handle the data
  * requests.
+ *
+ * The device can operate in the following modes, which is stored in the system properties
+ * ro.telephony.iwlan_operation_mode. If the system properties is missing, then it's tied to
+ * IRadio version. For 1.4 or above, it's legacy mode. For 1.3 or below, it's
+ *
+ * Legacy mode:
+ *      Frameworks send all data requests to the default data service, which is the cellular data
+ *      service. IWLAN should be still reported as a RAT on cellular network service.
+ *
+ * AP-assisted mode:
+ *      IWLAN is handled by IWLAN data service extending {@link android.telephony.data.DataService},
+ *      IWLAN network service extending {@link android.telephony.NetworkService}, and qualified
+ *      network service extending {@link android.telephony.data.QualifiedNetworksService}.
+ *
+ *      The following settings for service package name need to be configured properly for
+ *      frameworks to bind.
+ *
+ *      Package name of data service:
+ *          The resource overlay 'config_wwan_data_service_package' or,
+ *          the carrier config
+ *          {@link CarrierConfigManager#KEY_CARRIER_DATA_SERVICE_WLAN_PACKAGE_OVERRIDE_STRING}.
+ *          The carrier config takes precedence over the resource overlay if both exist.
+ *
+ *      Package name of network service
+ *          The resource overlay 'config_wwan_network_service_package' or
+ *          the carrier config
+ *          {@link CarrierConfigManager#KEY_CARRIER_NETWORK_SERVICE_WLAN_PACKAGE_OVERRIDE_STRING}.
+ *          The carrier config takes precedence over the resource overlay if both exist.
+ *
+ *      Package name of qualified network service
+ *          The resource overlay 'config_qualified_networks_service_package' or
+ *          the carrier config
+ *          {@link CarrierConfigManager#
+ *          KEY_CARRIER_QUALIFIED_NETWORKS_SERVICE_PACKAGE_OVERRIDE_STRING}.
+ *          The carrier config takes precedence over the resource overlay if both exist.
  */
 public class TransportManager extends Handler {
     private static final String TAG = TransportManager.class.getSimpleName();
@@ -59,12 +100,16 @@ public class TransportManager extends Handler {
 
     static {
         ACCESS_NETWORK_TRANSPORT_TYPE_MAP = new HashMap<>();
-        ACCESS_NETWORK_TRANSPORT_TYPE_MAP.put(AccessNetworkType.UNKNOWN, TransportType.WWAN);
-        ACCESS_NETWORK_TRANSPORT_TYPE_MAP.put(AccessNetworkType.GERAN, TransportType.WWAN);
-        ACCESS_NETWORK_TRANSPORT_TYPE_MAP.put(AccessNetworkType.UTRAN, TransportType.WWAN);
-        ACCESS_NETWORK_TRANSPORT_TYPE_MAP.put(AccessNetworkType.EUTRAN, TransportType.WWAN);
-        ACCESS_NETWORK_TRANSPORT_TYPE_MAP.put(AccessNetworkType.CDMA2000, TransportType.WWAN);
-        ACCESS_NETWORK_TRANSPORT_TYPE_MAP.put(AccessNetworkType.IWLAN, TransportType.WLAN);
+        ACCESS_NETWORK_TRANSPORT_TYPE_MAP.put(AccessNetworkType.GERAN,
+                AccessNetworkConstants.TRANSPORT_TYPE_WWAN);
+        ACCESS_NETWORK_TRANSPORT_TYPE_MAP.put(AccessNetworkType.UTRAN,
+                AccessNetworkConstants.TRANSPORT_TYPE_WWAN);
+        ACCESS_NETWORK_TRANSPORT_TYPE_MAP.put(AccessNetworkType.EUTRAN,
+                AccessNetworkConstants.TRANSPORT_TYPE_WWAN);
+        ACCESS_NETWORK_TRANSPORT_TYPE_MAP.put(AccessNetworkType.CDMA2000,
+                AccessNetworkConstants.TRANSPORT_TYPE_WWAN);
+        ACCESS_NETWORK_TRANSPORT_TYPE_MAP.put(AccessNetworkType.IWLAN,
+                AccessNetworkConstants.TRANSPORT_TYPE_WLAN);
     }
 
     private static final int EVENT_QUALIFIED_NETWORKS_CHANGED = 1;
@@ -73,7 +118,7 @@ public class TransportManager extends Handler {
             "ro.telephony.iwlan_operation_mode";
 
     @Retention(RetentionPolicy.SOURCE)
-    @IntDef(prefix = {"IWLAN_OPERATION_MODE_"},
+    @StringDef(prefix = {"IWLAN_OPERATION_MODE_"},
             value = {
                     IWLAN_OPERATION_MODE_DEFAULT,
                     IWLAN_OPERATION_MODE_LEGACY,
@@ -85,38 +130,48 @@ public class TransportManager extends Handler {
      * {@link #IWLAN_OPERATION_MODE_AP_ASSISTED}. On device that has IRadio 1.2 or below, it means
      * {@link #IWLAN_OPERATION_MODE_LEGACY}.
      */
-    public static final int IWLAN_OPERATION_MODE_DEFAULT = 0;
+    public static final String IWLAN_OPERATION_MODE_DEFAULT = "default";
 
     /**
      * IWLAN legacy mode. IWLAN is completely handled by the modem, and when the device is on
      * IWLAN, modem reports IWLAN as a RAT.
      */
-    public static final int IWLAN_OPERATION_MODE_LEGACY = 1;
+    public static final String IWLAN_OPERATION_MODE_LEGACY = "legacy";
 
     /**
      * IWLAN application processor assisted mode. IWLAN is handled by the bound IWLAN data service
      * and network service separately.
      */
-    public static final int IWLAN_OPERATION_MODE_AP_ASSISTED = 2;
+    public static final String IWLAN_OPERATION_MODE_AP_ASSISTED = "AP-assisted";
 
     private final Phone mPhone;
+
+    private final LocalLog mLocalLog = new LocalLog(100);
 
     /** The available transports. Must be one or more of AccessNetworkConstants.TransportType.XXX */
     private final int[] mAvailableTransports;
 
-    private final AccessNetworksManager mAccessNetworksManager;
+    @Nullable
+    private AccessNetworksManager mAccessNetworksManager;
 
     /**
      * Available networks. The key is the APN type, and the value is the available network list in
      * the preferred order.
      */
-    private final Map<Integer, int[]> mCurrentAvailableNetworks;
+    private final SparseArray<int[]> mCurrentAvailableNetworks;
 
     /**
      * The current transport of the APN type. The key is the APN type, and the value is the
      * transport.
      */
     private final Map<Integer, Integer> mCurrentTransports;
+
+    /**
+     * The pending handover list. This is a list of APNs that are being handover to the new
+     * transport. The entry will be removed once handover is completed. The key
+     * is the APN type, and the value is the target transport that the APN is handovered to.
+     */
+    private final SparseIntArray mPendingHandoverApns;
 
     /**
      * The registrants for listening data handover needed events.
@@ -128,29 +183,47 @@ public class TransportManager extends Handler {
      */
     @VisibleForTesting
     public static final class HandoverParams {
+        /**
+         * The callback for handover complete.
+         */
+        public interface HandoverCallback {
+            /**
+             * Called when handover is completed.
+             *
+             * @param success {@true} if handover succeeded, otherwise failed.
+             */
+            void onCompleted(boolean success);
+        }
+
         public final @ApnType int apnType;
         public final int targetTransport;
-        HandoverParams(int apnType, int targetTransport) {
+        public final HandoverCallback callback;
+        HandoverParams(int apnType, int targetTransport, HandoverCallback callback) {
             this.apnType = apnType;
             this.targetTransport = targetTransport;
+            this.callback = callback;
         }
     }
 
     public TransportManager(Phone phone) {
         mPhone = phone;
-        mAccessNetworksManager = new AccessNetworksManager(phone);
-        mCurrentAvailableNetworks = new ConcurrentHashMap<>();
+        mCurrentAvailableNetworks = new SparseArray<>();
         mCurrentTransports = new ConcurrentHashMap<>();
+        mPendingHandoverApns = new SparseIntArray();
         mHandoverNeededEventRegistrants = new RegistrantList();
 
         if (isInLegacyMode()) {
+            log("operates in legacy mode.");
             // For legacy mode, WWAN is the only transport to handle all data connections, even
             // the IWLAN ones.
-            mAvailableTransports = new int[]{TransportType.WWAN};
+            mAvailableTransports = new int[]{AccessNetworkConstants.TRANSPORT_TYPE_WWAN};
         } else {
+            log("operates in AP-assisted mode.");
+            mAccessNetworksManager = new AccessNetworksManager(phone);
             mAccessNetworksManager.registerForQualifiedNetworksChanged(this,
                     EVENT_QUALIFIED_NETWORKS_CHANGED);
-            mAvailableTransports = new int[]{TransportType.WWAN, TransportType.WLAN};
+            mAvailableTransports = new int[]{AccessNetworkConstants.TRANSPORT_TYPE_WWAN,
+                    AccessNetworkConstants.TRANSPORT_TYPE_WLAN};
         }
     }
 
@@ -173,6 +246,17 @@ public class TransportManager extends Handler {
         int[] newNetworkList = newNetworks.qualifiedNetworks;
         int[] currentNetworkList = mCurrentAvailableNetworks.get(apnType);
 
+        if (ArrayUtils.isEmpty(currentNetworkList)
+                && ACCESS_NETWORK_TRANSPORT_TYPE_MAP.get(newNetworkList[0])
+                == AccessNetworkConstants.TRANSPORT_TYPE_WLAN) {
+            // This is a special case that when first time boot up in airplane mode with wifi on,
+            // qualified network service reports IWLAN as the preferred network. Although there
+            // is no live data connection on cellular, there might be network requests which were
+            // already sent to cellular DCT. In this case, we still need to handover the network
+            // request to the new transport.
+            return true;
+        }
+
         // If the current network list is empty, but the new network list is not, then we can
         // directly setup data on the new network. If the current network list is not empty, but
         // the new network is, then we can tear down the data directly. Therefore if one of the
@@ -181,11 +265,18 @@ public class TransportManager extends Handler {
             return false;
         }
 
+
+        if (mPendingHandoverApns.get(newNetworks.apnType)
+                == ACCESS_NETWORK_TRANSPORT_TYPE_MAP.get(newNetworkList[0])) {
+            log("Handover not needed. There is already an ongoing handover.");
+            return false;
+        }
+
         // The list is networks in the preferred order. For now we only pick the first element
         // because it's the most preferred. In the future we should also consider the rest in the
         // list, for example, the first one violates carrier/user policy.
-        return !ACCESS_NETWORK_TRANSPORT_TYPE_MAP.get(newNetworkList[0]).equals(
-                ACCESS_NETWORK_TRANSPORT_TYPE_MAP.get(currentNetworkList[0]));
+        return !ACCESS_NETWORK_TRANSPORT_TYPE_MAP.get(newNetworkList[0])
+                .equals(getCurrentTransport(newNetworks.apnType));
     }
 
     private static boolean areNetworksValid(QualifiedNetworks networks) {
@@ -203,49 +294,51 @@ public class TransportManager extends Handler {
     /**
      * Set the current transport of apn type.
      *
-     * @apnType The APN type
-     * @transport The transport. Must be WWAN or WLAN.
+     * @param apnType The APN type
+     * @param transport The transport. Must be WWAN or WLAN.
      */
-    public void setCurrentTransport(@ApnType int apnType, int transport) {
+    private void setCurrentTransport(@ApnType int apnType, int transport) {
         mCurrentTransports.put(apnType, transport);
+        logl("setCurrentTransport: apnType=" + ApnSetting.getApnTypeString(apnType)
+                + ", transport=" + AccessNetworkConstants.transportTypeToString(transport));
     }
 
     private synchronized void updateAvailableNetworks(List<QualifiedNetworks> networksList) {
-        log("updateAvailableNetworks: " + networksList);
+        logl("updateAvailableNetworks: " + networksList);
         for (QualifiedNetworks networks : networksList) {
             if (areNetworksValid(networks)) {
                 if (isHandoverNeeded(networks)) {
-                    mCurrentAvailableNetworks.put(networks.apnType, networks.qualifiedNetworks);
                     // If handover is needed, perform the handover works. For now we only pick the
                     // first element because it's the most preferred. In the future we should also
                     // consider the rest in the list, for example, the first one violates
                     // carrier/user policy.
                     int targetTransport = ACCESS_NETWORK_TRANSPORT_TYPE_MAP.get(
                             networks.qualifiedNetworks[0]);
-                    log("Handover needed for APN type: "
+                    logl("Handover needed for APN type: "
                             + ApnSetting.getApnTypeString(networks.apnType) + ", target transport: "
-                            + TransportType.toString(targetTransport));
+                            + AccessNetworkConstants.transportTypeToString(targetTransport));
+                    mPendingHandoverApns.put(networks.apnType, targetTransport);
                     mHandoverNeededEventRegistrants.notifyResult(
-                            new HandoverParams(networks.apnType, targetTransport));
-
-                } else {
-                    // If handover is not needed, immediately update the available networks and
-                    // transport.
-                    log("Handover not needed for APN type: "
-                            + ApnSetting.getApnTypeString(networks.apnType));
-                    mCurrentAvailableNetworks.put(networks.apnType, networks.qualifiedNetworks);
-                    int transport = TransportType.WWAN;
-                    if (!ArrayUtils.isEmpty(networks.qualifiedNetworks)
-                            && ACCESS_NETWORK_TRANSPORT_TYPE_MAP.containsKey(
-                                    networks.qualifiedNetworks[0])) {
-                        // For now we only pick the first element because it's the most preferred.
-                        // In the future we should also consider the rest in the list, for example,
-                        // the first one violates carrier/user policy.
-                        transport = ACCESS_NETWORK_TRANSPORT_TYPE_MAP
-                                .get(networks.qualifiedNetworks[0]);
-                    }
-                    setCurrentTransport(networks.apnType, transport);
+                            new HandoverParams(networks.apnType, targetTransport, success -> {
+                                // The callback for handover completed.
+                                if (success) {
+                                    logl("Handover succeeded.");
+                                } else {
+                                    logl("APN type "
+                                            + ApnSetting.getApnTypeString(networks.apnType)
+                                            + " handover to "
+                                            + AccessNetworkConstants.transportTypeToString(
+                                                    targetTransport) + " failed.");
+                                }
+                                // No matter succeeded or not, we need to set the current transport
+                                // to the new one. If failed, there will be retry afterwards anyway.
+                                setCurrentTransport(networks.apnType, targetTransport);
+                                mPendingHandoverApns.delete(networks.apnType);
+                            }));
                 }
+                mCurrentAvailableNetworks.put(networks.apnType, networks.qualifiedNetworks);
+            } else {
+                loge("Invalid networks received: " + networks);
             }
         }
     }
@@ -261,20 +354,17 @@ public class TransportManager extends Handler {
     }
 
     /**
-     * @return True if in IWLAN legacy mode. Operating in legacy mode means telephony will send
-     * all data requests to the default data service, which is the cellular data service.
-     * AP-assisted mode requires properly configuring the resource overlay
-     * 'config_wwan_data_service_package' (or the carrier config
-     * {@link CarrierConfigManager#KEY_CARRIER_DATA_SERVICE_WLAN_PACKAGE_OVERRIDE_STRING }) to
-     * the IWLAN data service package, 'config_wwan_network_service_package' (or the carrier config
-     * {@link CarrierConfigManager#KEY_CARRIER_NETWORK_SERVICE_WLAN_PACKAGE_OVERRIDE_STRING })
-     * to the IWLAN network service package, and 'config_qualified_networks_service_package' (or the
-     * carrier config
-     * {@link CarrierConfigManager#KEY_CARRIER_QUALIFIED_NETWORKS_SERVICE_PACKAGE_OVERRIDE_STRING})
-     * to the qualified networks service package.
+     * @return {@code true} if the device operates in legacy mode, otherwise {@code false}.
      */
     public boolean isInLegacyMode() {
-        return (mPhone.mCi.getIwlanOperationMode() == IWLAN_OPERATION_MODE_LEGACY);
+        // Get IWLAN operation mode from the system property. If the system property is missing or
+        // mis-configured the default behavior is tied to the IRadio version. For 1.4 or above, it's
+        // AP-assisted mode, for 1.3 or below, it's legacy mode. For IRadio 1.3 or below, no matter
+        // what the configuration is, it will always be legacy mode.
+        String mode = SystemProperties.get(SYSTEM_PROPERTIES_IWLAN_OPERATION_MODE);
+
+        return mode.equals(IWLAN_OPERATION_MODE_LEGACY)
+                || mPhone.getHalVersion().less(RIL.RADIO_HAL_VERSION_1_4);
     }
 
     /**
@@ -286,12 +376,12 @@ public class TransportManager extends Handler {
     public int getCurrentTransport(@ApnType int apnType) {
         // In legacy mode, always route to cellular.
         if (isInLegacyMode()) {
-            return TransportType.WWAN;
+            return AccessNetworkConstants.TRANSPORT_TYPE_WWAN;
         }
 
         // If we can't find the corresponding transport, always route to cellular.
         return mCurrentTransports.get(apnType) == null
-                ? TransportType.WWAN : mCurrentTransports.get(apnType);
+                ? AccessNetworkConstants.TRANSPORT_TYPE_WWAN : mCurrentTransports.get(apnType);
     }
 
     /**
@@ -327,15 +417,27 @@ public class TransportManager extends Handler {
         pw.println("TransportManager:");
         pw.increaseIndent();
         pw.println("mAvailableTransports=[" + Arrays.stream(mAvailableTransports)
-                .mapToObj(type -> TransportType.toString(type))
+                .mapToObj(type -> AccessNetworkConstants.transportTypeToString(type))
                 .collect(Collectors.joining(",")) + "]");
         pw.println("mCurrentAvailableNetworks=" + mCurrentAvailableNetworks);
         pw.println("mCurrentTransports=" + mCurrentTransports);
         pw.println("isInLegacy=" + isInLegacyMode());
-        pw.println("IWLAN operation mode=" + mPhone.mCi.getIwlanOperationMode());
-        mAccessNetworksManager.dump(fd, pw, args);
+        pw.println("IWLAN operation mode="
+                + SystemProperties.get(SYSTEM_PROPERTIES_IWLAN_OPERATION_MODE));
+        if (mAccessNetworksManager != null) {
+            mAccessNetworksManager.dump(fd, pw, args);
+        }
+        pw.println("Local logs=");
+        pw.increaseIndent();
+        mLocalLog.dump(fd, pw, args);
+        pw.decreaseIndent();
         pw.decreaseIndent();
         pw.flush();
+    }
+
+    private void logl(String s) {
+        log(s);
+        mLocalLog.log(s);
     }
 
     private void log(String s) {

@@ -15,7 +15,7 @@
  */
 package com.android.internal.telephony;
 
-import static android.telephony.PhoneStateListener.LISTEN_ACTIVE_DATA_SUBID_CHANGE;
+import static android.telephony.PhoneStateListener.LISTEN_ACTIVE_DATA_SUBSCRIPTION_ID_CHANGE;
 import static android.telephony.PhoneStateListener.LISTEN_PHONE_CAPABILITY_CHANGE;
 import static android.telephony.PhoneStateListener.LISTEN_SRVCC_STATE_CHANGED;
 
@@ -23,6 +23,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.fail;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.when;
 
 import android.os.HandlerThread;
 import android.os.ServiceManager;
@@ -60,7 +61,7 @@ public class TelephonyRegistryTest extends TelephonyTest {
             setReady(true);
         }
         @Override
-        public void onActiveDataSubIdChanged(int activeSubId) {
+        public void onActiveDataSubscriptionIdChanged(int activeSubId) {
             mActiveSubId = activeSubId;
             setReady(true);
         }
@@ -124,11 +125,13 @@ public class TelephonyRegistryTest extends TelephonyTest {
     public void testActiveDataSubChanged() {
         // mTelephonyRegistry.listen with notifyNow = true should trigger callback immediately.
         setReady(false);
+        int[] activeSubs = {0, 1, 2};
+        when(mSubscriptionManager.getActiveSubscriptionIdList()).thenReturn(activeSubs);
         int activeSubId = 0;
         mTelephonyRegistry.notifyActiveDataSubIdChanged(activeSubId);
         mTelephonyRegistry.listen(mContext.getOpPackageName(),
                 mPhoneStateListener.callback,
-                LISTEN_ACTIVE_DATA_SUBID_CHANGE, true);
+                LISTEN_ACTIVE_DATA_SUBSCRIPTION_ID_CHANGE, true);
         waitUntilReady();
         assertEquals(activeSubId, mActiveSubId);
 

@@ -19,6 +19,8 @@ package com.android.internal.telephony.dataconnection;
 import static android.net.NetworkPolicyManager.OVERRIDE_CONGESTED;
 import static android.net.NetworkPolicyManager.OVERRIDE_UNMETERED;
 
+import android.annotation.IntDef;
+import android.annotation.Nullable;
 import android.app.PendingIntent;
 import android.content.BroadcastReceiver;
 import android.content.Context;
@@ -28,9 +30,8 @@ import android.net.ConnectivityManager;
 import android.net.KeepalivePacketData;
 import android.net.LinkAddress;
 import android.net.LinkProperties;
-import android.net.NattKeepalivePacketData;
-import android.net.NetworkAgent;
 import android.net.NetworkCapabilities;
+import android.net.NetworkFactory;
 import android.net.NetworkInfo;
 import android.net.NetworkMisc;
 import android.net.NetworkRequest;
@@ -40,12 +41,14 @@ import android.net.RouteInfo;
 import android.net.SocketKeepalive;
 import android.net.StringNetworkSpecifier;
 import android.os.AsyncResult;
-import android.os.Looper;
 import android.os.Message;
 import android.os.SystemClock;
 import android.os.SystemProperties;
+import android.provider.Telephony;
+import android.telephony.AccessNetworkConstants;
 import android.telephony.AccessNetworkConstants.TransportType;
 import android.telephony.DataFailCause;
+import android.telephony.NetworkRegistrationInfo;
 import android.telephony.Rlog;
 import android.telephony.ServiceState;
 import android.telephony.SubscriptionManager;
@@ -56,9 +59,7 @@ import android.telephony.data.DataProfile;
 import android.telephony.data.DataService;
 import android.telephony.data.DataServiceCallback;
 import android.text.TextUtils;
-import android.util.LocalLog;
 import android.util.Pair;
-import android.util.SparseArray;
 import android.util.StatsLog;
 import android.util.TimeUtils;
 
@@ -69,6 +70,7 @@ import com.android.internal.telephony.DctConstants;
 import com.android.internal.telephony.LinkCapacityEstimate;
 import com.android.internal.telephony.Phone;
 import com.android.internal.telephony.PhoneConstants;
+import com.android.internal.telephony.PhoneFactory;
 import com.android.internal.telephony.RILConstants;
 import com.android.internal.telephony.RetryManager;
 import com.android.internal.telephony.ServiceStateTracker;
@@ -86,6 +88,8 @@ import com.android.internal.util.StateMachine;
 import java.io.FileDescriptor;
 import java.io.PrintWriter;
 import java.io.StringWriter;
+import java.lang.annotation.Retention;
+import java.lang.annotation.RetentionPolicy;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.util.ArrayList;
@@ -114,8 +118,34 @@ public class DataConnection extends StateMachine {
 
     private static final String NETWORK_TYPE = "MOBILE";
 
-    private static final String ACTION_DDS_SWITCH_DONE
-            = "org.codeaurora.intent.action.ACTION_DDS_SWITCH_DONE";
+    private static final String RAT_NAME_5G = "nr";
+    private static final String RAT_NAME_EVDO = "evdo";
+
+    /**
+     * The data connection is not being or been handovered. Note this is the state for the source
+     * data connection, not destination data connection
+     */
+    private static final int HANDOVER_STATE_IDLE = 1;
+
+    /**
+     * The data connection is being handovered. Note this is the state for the source
+     * data connection, not destination data connection.
+     */
+    private static final int HANDOVER_STATE_BEING_TRANSFERRED = 2;
+
+    /**
+     * The data connection is already handovered. Note this is the state for the source
+     * data connection, not destination data connection.
+     */
+    private static final int HANDOVER_STATE_COMPLETED = 3;
+
+    /** @hide */
+    @Retention(RetentionPolicy.SOURCE)
+    @IntDef(prefix = {"HANDOVER_STATE_"}, value = {
+            HANDOVER_STATE_IDLE,
+            HANDOVER_STATE_BEING_TRANSFERRED,
+            HANDOVER_STATE_COMPLETED})
+    public @interface HandoverState {}
 
     // The data connection providing default Internet connection will have a higher score of 50.
     // Other connections will have a slightly lower score of 45. The intention is other connections
@@ -142,6 +172,8 @@ public class DataConnection extends StateMachine {
     private DcTracker mDct = null;
 
     private String[] mPcscfAddr;
+
+    private final String mTagSuffix;
 
     /**
      * Used internally for saving connecting parameters.
@@ -214,6 +246,7 @@ public class DataConnection extends StateMachine {
 
     private Phone mPhone;
     private DataServiceManager mDataServiceManager;
+    private final int mTransportType;
     private LinkProperties mLinkProperties = new LinkProperties();
     private long mCreateTime;
     private long mLastFailTime;
@@ -225,12 +258,23 @@ public class DataConnection extends StateMachine {
     private int mRilRat = Integer.MAX_VALUE;
     private int mDataRegState = Integer.MAX_VALUE;
     private NetworkInfo mNetworkInfo;
+
+    /** The corresponding network agent for this data connection. */
     private DcNetworkAgent mNetworkAgent;
-    private LocalLog mNetCapsLocalLog = new LocalLog(50);
+
+    /**
+     * The network agent from handover source data connection. This is the potential network agent
+     * that will be transferred here after handover completed.
+     */
+    private DcNetworkAgent mHandoverSourceNetworkAgent;
+
     private int mDisabledApnTypeBitMask = 0;
 
     int mTag;
     public int mCid;
+
+    @HandoverState
+    private int mHandoverState;
     private final Map<ApnContext, ConnectionParams> mApnContexts = new ConcurrentHashMap<>();
     PendingIntent mReconnectIntent = null;
 
@@ -264,10 +308,9 @@ public class DataConnection extends StateMachine {
     static final int EVENT_RESET = BASE + 24;
     static final int EVENT_REEVALUATE_RESTRICTED_STATE = BASE + 25;
     static final int EVENT_REEVALUATE_DATA_CONNECTION_PROPERTIES = BASE + 26;
-    static final int EVENT_DATA_CONNECTION_DDS_SWITCHED = BASE + 27;
 
     private static final int CMD_TO_STRING_COUNT =
-            EVENT_DATA_CONNECTION_DDS_SWITCHED - BASE + 1;
+            EVENT_REEVALUATE_DATA_CONNECTION_PROPERTIES - BASE + 1;
 
     private static String[] sCmdToString = new String[CMD_TO_STRING_COUNT];
     static {
@@ -299,8 +342,6 @@ public class DataConnection extends StateMachine {
         sCmdToString[EVENT_KEEPALIVE_STOP_REQUEST - BASE] = "EVENT_KEEPALIVE_STOP_REQUEST";
         sCmdToString[EVENT_LINK_CAPACITY_CHANGED - BASE] = "EVENT_LINK_CAPACITY_CHANGED";
         sCmdToString[EVENT_RESET - BASE] = "EVENT_RESET";
-        sCmdToString[EVENT_DATA_CONNECTION_DDS_SWITCHED - BASE] =
-                "EVENT_DATA_CONNECTION_DDS_SWITCHED";
         sCmdToString[EVENT_REEVALUATE_RESTRICTED_STATE - BASE] =
                 "EVENT_REEVALUATE_RESTRICTED_STATE";
         sCmdToString[EVENT_REEVALUATE_DATA_CONNECTION_PROPERTIES - BASE] =
@@ -330,12 +371,13 @@ public class DataConnection extends StateMachine {
                                                     DataServiceManager dataServiceManager,
                                                     DcTesterFailBringUpAll failBringUpAll,
                                                     DcController dcc) {
-        String transportType = (dataServiceManager.getTransportType() == TransportType.WWAN)
+        String transportType = (dataServiceManager.getTransportType()
+                == AccessNetworkConstants.TRANSPORT_TYPE_WWAN)
                 ? "C"   // Cellular
                 : "I";  // IWLAN
-        DataConnection dc = new DataConnection(phone,
-                "DC-" + transportType + "-" + mInstanceNumber.incrementAndGet(), id, dct,
-                dataServiceManager, failBringUpAll, dcc);
+        DataConnection dc = new DataConnection(phone, transportType + "-"
+                + mInstanceNumber.incrementAndGet(), id, dct, dataServiceManager, failBringUpAll,
+                dcc);
         dc.start();
         if (DBG) dc.log("Made " + dc.getName());
         return dc;
@@ -366,6 +408,10 @@ public class DataConnection extends StateMachine {
 
     boolean isActivating() {
         return getCurrentState() == mActivatingState;
+    }
+
+    boolean hasBeenTransferred() {
+        return mHandoverState == HANDOVER_STATE_COMPLETED;
     }
 
     int getCid() {
@@ -476,7 +522,7 @@ public class DataConnection extends StateMachine {
 
         if (result.newLp.equals(result.oldLp) == false &&
                 mNetworkAgent != null) {
-            mNetworkAgent.sendLinkProperties(mLinkProperties);
+            mNetworkAgent.sendLinkProperties(mLinkProperties, DataConnection.this);
         }
 
         return result;
@@ -524,29 +570,12 @@ public class DataConnection extends StateMachine {
         return false;
     }
 
-    /* Receiver to handle DDS change event */
-    private BroadcastReceiver mBroadcastReceiver = new BroadcastReceiver() {
-        public void onReceive(Context context, Intent intent) {
-            String action = intent.getAction();
-            log("mBroadcastReceiver - " + action);
-            if (action.equals(ACTION_DDS_SWITCH_DONE)) {
-                int ddsSubId = intent.getIntExtra(PhoneConstants.SUBSCRIPTION_KEY,
-                        SubscriptionManager.INVALID_SUBSCRIPTION_ID);
-                log("got ACTION_DDS_SWITCH_DONE, new DDS = "
-                        + ddsSubId + "update network score");
-                if (mNetworkAgent != null && mPhone.getSubId() != ddsSubId) {
-                    DataConnection.this.sendMessage(DataConnection.this.
-                            obtainMessage(EVENT_DATA_CONNECTION_DDS_SWITCHED));
-                }
-            }
-        }
-    };
-
     //***** Constructor (NOTE: uses dcc.getHandler() as its Handler)
-    private DataConnection(Phone phone, String name, int id,
+    private DataConnection(Phone phone, String tagSuffix, int id,
                            DcTracker dct, DataServiceManager dataServiceManager,
                            DcTesterFailBringUpAll failBringUpAll, DcController dcc) {
-        super(name, dcc.getHandler());
+        super("DC-" + tagSuffix, dcc.getHandler());
+        mTagSuffix = tagSuffix;
         setLogRecSize(300);
         setLogOnlyTransitions(true);
         if (DBG) log("DataConnection created");
@@ -554,6 +583,7 @@ public class DataConnection extends StateMachine {
         mPhone = phone;
         mDct = dct;
         mDataServiceManager = dataServiceManager;
+        mTransportType = dataServiceManager.getTransportType();
         mDcTesterFailBringUpAll = failBringUpAll;
         mDcController = dcc;
         mId = id;
@@ -577,15 +607,13 @@ public class DataConnection extends StateMachine {
     }
 
     /**
-     * Get the DcTracker for handover. There are multiple DcTrackers for different transports (e.g.
-     * WWAN, WLAN). For data handover, we need to handover the existing data connection from current
-     * DcTracker to the DcTracker on another transport.
+     * Get the source transport for handover. For example, handover from WWAN to WLAN, WWAN is the
+     * source transport, and vice versa.
      */
-    private DcTracker getHandoverDcTracker() {
-        int transportType = mDataServiceManager.getTransportType();
-        // Get the DcTracker from the other transport.
-        return mPhone.getDcTracker(transportType == TransportType.WWAN
-                ? TransportType.WLAN : TransportType.WWAN);
+    private @TransportType int getHandoverSourceTransport() {
+        return mTransportType == AccessNetworkConstants.TRANSPORT_TYPE_WWAN
+                ? AccessNetworkConstants.TRANSPORT_TYPE_WLAN
+                : AccessNetworkConstants.TRANSPORT_TYPE_WWAN;
     }
 
     /**
@@ -598,12 +626,10 @@ public class DataConnection extends StateMachine {
      * @return Fail cause if failed to setup data connection. {@link DataFailCause#NONE} if success.
      */
     private @DataFailCause.FailCause int connect(ConnectionParams cp) {
-        if (DBG) {
-            log("connect: carrier='" + mApnSetting.getEntryName()
-                    + "' APN='" + mApnSetting.getApnName()
-                    + "' proxy='" + mApnSetting.getProxyAddressAsString()
-                    + "' port='" + mApnSetting.getProxyPort() + "'");
-        }
+        log("connect: carrier='" + mApnSetting.getEntryName()
+                + "' APN='" + mApnSetting.getApnName()
+                + "' proxy='" + mApnSetting.getProxyAddressAsString()
+                + "' port='" + mApnSetting.getProxyPort() + "'");
         if (cp.mApnContext != null) cp.mApnContext.requestLog("DataConnection.connect");
 
         // Check if we should fake an error.
@@ -651,7 +677,7 @@ public class DataConnection extends StateMachine {
         if (cp.mRequestType == DcTracker.REQUEST_TYPE_HANDOVER) {
             // If this is a data setup for handover, we need to pass the link properties
             // of the existing data connection to the modem.
-            DcTracker dcTracker = getHandoverDcTracker();
+            DcTracker dcTracker = mPhone.getDcTracker(getHandoverSourceTransport());
             if (dcTracker == null || cp.mApnContext == null) {
                 loge("connect: Handover failed. dcTracker=" + dcTracker + ", apnContext="
                         + cp.mApnContext);
@@ -665,6 +691,11 @@ public class DataConnection extends StateMachine {
             }
 
             linkProperties = dc.getLinkProperties();
+            // Preserve the potential network agent from the source data connection. The ownership
+            // is not transferred at this moment.
+            mHandoverSourceNetworkAgent = dc.getNetworkAgent();
+            log("Get the handover source network agent: " + mHandoverSourceNetworkAgent);
+            dc.setHandoverState(HANDOVER_STATE_BEING_TRANSFERRED);
             if (linkProperties == null) {
                 loge("connect: Can't find link properties of handover data connection. dc="
                         + dc);
@@ -683,7 +714,7 @@ public class DataConnection extends StateMachine {
                 linkProperties,
                 msg);
         TelephonyMetrics.getInstance().writeSetupDataCall(mPhone.getPhoneId(), cp.mRilRat,
-                dp.getProfileId(), dp.getApn(), dp.getProtocol());
+                dp.getProfileId(), dp.getApn(), dp.getProtocolType());
         return DataFailCause.NONE;
     }
 
@@ -885,19 +916,20 @@ public class DataConnection extends StateMachine {
         } else if (resultCode == DataServiceCallback.RESULT_ERROR_ILLEGAL_STATE) {
             result = SetupResult.ERROR_RADIO_NOT_AVAILABLE;
             result.mFailCause = DataFailCause.RADIO_NOT_AVAILABLE;
-        } else if (response.getStatus() != 0) {
-            if (response.getStatus() == DataFailCause.RADIO_NOT_AVAILABLE) {
+        } else if (response.getCause() != 0) {
+            if (response.getCause() == DataFailCause.RADIO_NOT_AVAILABLE) {
                 result = SetupResult.ERROR_RADIO_NOT_AVAILABLE;
                 result.mFailCause = DataFailCause.RADIO_NOT_AVAILABLE;
             } else {
                 result = SetupResult.ERROR_DATA_SERVICE_SPECIFIC_ERROR;
-                result.mFailCause = DataFailCause.getFailCause(response.getStatus());
+                result.mFailCause = DataFailCause.getFailCause(response.getCause());
             }
         } else {
             if (DBG) log("onSetupConnectionCompleted received successful DataCallResponse");
-            mCid = response.getCallId();
+            mCid = response.getId();
 
-            mPcscfAddr = response.getPcscfs().toArray(new String[response.getPcscfs().size()]);
+            mPcscfAddr = response.getPcscfAddresses().stream()
+                    .map(InetAddress::getHostAddress).toArray(String[]::new);
 
             result = updateLinkProperty(response).setupResult;
         }
@@ -925,17 +957,25 @@ public class DataConnection extends StateMachine {
         return true;
     }
 
+    /**
+     * TCP buffer size config based on the ril technology. There are 6 parameters
+     * read_min, read_default, read_max, write_min, write_default, write_max in the TCP buffer
+     * config string and they are separated by a comma. The unit of these parameters is byte.
+     */
     private static final String TCP_BUFFER_SIZES_GPRS = "4092,8760,48000,4096,8760,48000";
     private static final String TCP_BUFFER_SIZES_EDGE = "4093,26280,70800,4096,16384,70800";
     private static final String TCP_BUFFER_SIZES_UMTS = "58254,349525,1048576,58254,349525,1048576";
-    private static final String TCP_BUFFER_SIZES_1XRTT= "16384,32768,131072,4096,16384,102400";
+    private static final String TCP_BUFFER_SIZES_1XRTT = "16384,32768,131072,4096,16384,102400";
     private static final String TCP_BUFFER_SIZES_EVDO = "4094,87380,262144,4096,16384,262144";
-    private static final String TCP_BUFFER_SIZES_EHRPD= "131072,262144,1048576,4096,16384,524288";
-    private static final String TCP_BUFFER_SIZES_HSDPA= "61167,367002,1101005,8738,52429,262114";
+    private static final String TCP_BUFFER_SIZES_EHRPD = "131072,262144,1048576,4096,16384,524288";
+    private static final String TCP_BUFFER_SIZES_HSDPA = "61167,367002,1101005,8738,52429,262114";
     private static final String TCP_BUFFER_SIZES_HSPA = "40778,244668,734003,16777,100663,301990";
-    private static final String TCP_BUFFER_SIZES_LTE  =
+    private static final String TCP_BUFFER_SIZES_LTE =
             "524288,1048576,2097152,262144,524288,1048576";
-    private static final String TCP_BUFFER_SIZES_HSPAP= "122334,734003,2202010,32040,192239,576717";
+    private static final String TCP_BUFFER_SIZES_HSPAP =
+            "122334,734003,2202010,32040,192239,576717";
+    private static final String TCP_BUFFER_SIZES_NR =
+            "2097152,6291456,16777216,512000,2097152,8388608";
 
     private void updateTcpBufferSizes(int rilRat) {
         String sizes = null;
@@ -950,7 +990,13 @@ public class DataConnection extends StateMachine {
         if (rilRat == ServiceState.RIL_RADIO_TECHNOLOGY_EVDO_0 ||
                 rilRat == ServiceState.RIL_RADIO_TECHNOLOGY_EVDO_A ||
                 rilRat == ServiceState.RIL_RADIO_TECHNOLOGY_EVDO_B) {
-            ratName = "evdo";
+            ratName = RAT_NAME_EVDO;
+        }
+
+        // NR 5G Non-Standalone use LTE cell as the primary cell, the ril technology is LTE in this
+        // case. We use NR 5G TCP buffer size when connected to NR 5G Non-Standalone network.
+        if (rilRat == ServiceState.RIL_RADIO_TECHNOLOGY_LTE && isNRConnected()) {
+            ratName = RAT_NAME_5G;
         }
 
         // in the form: "ratname:rmem_min,rmem_def,rmem_max,wmem_min,wmem_def,wmem_max"
@@ -998,7 +1044,12 @@ public class DataConnection extends StateMachine {
                     break;
                 case ServiceState.RIL_RADIO_TECHNOLOGY_LTE:
                 case ServiceState.RIL_RADIO_TECHNOLOGY_LTE_CA:
-                    sizes = TCP_BUFFER_SIZES_LTE;
+                    // Use NR 5G TCP buffer size when connected to NR 5G Non-Standalone network.
+                    if (isNRConnected()) {
+                        sizes = TCP_BUFFER_SIZES_NR;
+                    } else {
+                        sizes = TCP_BUFFER_SIZES_LTE;
+                    }
                     break;
                 case ServiceState.RIL_RADIO_TECHNOLOGY_HSPAP:
                     sizes = TCP_BUFFER_SIZES_HSPAP;
@@ -1096,7 +1147,8 @@ public class DataConnection extends StateMachine {
         // unmetered.
         for (ApnContext apnContext : mApnContexts.keySet()) {
             DataConnectionReasons dataConnectionReasons = new DataConnectionReasons();
-            boolean isDataAllowed = mDct.isDataAllowed(apnContext, dataConnectionReasons);
+            boolean isDataAllowed = mDct.isDataAllowed(apnContext, DcTracker.REQUEST_TYPE_NORMAL,
+                    dataConnectionReasons);
             if (!isDataAllowed || !dataConnectionReasons.contains(
                     DataConnectionReasons.DataAllowedReasonType.UNMETERED_APN)) {
                 return false;
@@ -1169,6 +1221,10 @@ public class DataConnection extends StateMachine {
                         result.addCapability(NetworkCapabilities.NET_CAPABILITY_EIMS);
                         break;
                     }
+                    case PhoneConstants.APN_TYPE_MCX: {
+                        result.addCapability(NetworkCapabilities.NET_CAPABILITY_MCX);
+                        break;
+                    }
                     default:
                 }
             }
@@ -1235,6 +1291,27 @@ public class DataConnection extends StateMachine {
     }
 
     /**
+     * @return {@code True} if 464xlat should be skipped.
+     */
+    @VisibleForTesting
+    public boolean shouldSkip464Xlat() {
+        switch (mApnSetting.getSkip464Xlat()) {
+            case Telephony.Carriers.SKIP_464XLAT_ENABLE:
+                return true;
+            case Telephony.Carriers.SKIP_464XLAT_DISABLE:
+                return false;
+            case Telephony.Carriers.SKIP_464XLAT_DEFAULT:
+            default:
+                break;
+        }
+
+        // As default, return true if ims and no internet
+        final NetworkCapabilities nc = getNetworkCapabilities();
+        return nc.hasCapability(NetworkCapabilities.NET_CAPABILITY_IMS)
+                && !nc.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
+    }
+
+    /**
      * @return {@code} true iff. {@code address} is a literal IPv4 or IPv6 address.
      */
     @VisibleForTesting
@@ -1247,7 +1324,7 @@ public class DataConnection extends StateMachine {
     private SetupResult setLinkProperties(DataCallResponse response,
             LinkProperties linkProperties) {
         // Check if system property dns usable
-        String propertyPrefix = "net." + response.getIfname() + ".";
+        String propertyPrefix = "net." + response.getInterfaceName() + ".";
         String dnsServers[] = new String[2];
         dnsServers[0] = SystemProperties.get(propertyPrefix + "dns1");
         dnsServers[1] = SystemProperties.get(propertyPrefix + "dns2");
@@ -1259,10 +1336,10 @@ public class DataConnection extends StateMachine {
         // a failure we'll clear again at the bottom of this code.
         linkProperties.clear();
 
-        if (response.getStatus() == DataFailCause.NONE) {
+        if (response.getCause() == DataFailCause.NONE) {
             try {
                 // set interface name
-                linkProperties.setInterfaceName(response.getIfname());
+                linkProperties.setInterfaceName(response.getInterfaceName());
 
                 // set link addresses
                 if (response.getAddresses().size() > 0) {
@@ -1276,12 +1353,13 @@ public class DataConnection extends StateMachine {
                         }
                     }
                 } else {
-                    throw new UnknownHostException("no address for ifname=" + response.getIfname());
+                    throw new UnknownHostException("no address for ifname="
+                            + response.getInterfaceName());
                 }
 
                 // set dns servers
-                if (response.getDnses().size() > 0) {
-                    for (InetAddress dns : response.getDnses()) {
+                if (response.getDnsAddresses().size() > 0) {
+                    for (InetAddress dns : response.getDnsAddresses()) {
                         if (!dns.isAnyLocalAddress()) {
                             linkProperties.addDnsServer(dns);
                         }
@@ -1305,26 +1383,13 @@ public class DataConnection extends StateMachine {
                 }
 
                 // set pcscf
-                if (response.getPcscfs().size() > 0) {
-                    for (String pcscf : response.getPcscfs()) {
-                        if (pcscf == null) continue;
-                        pcscf = pcscf.trim();
-                        if (pcscf.isEmpty()) continue;
-                        InetAddress ia;
-                        try {
-                            ia = NetworkUtils.numericToInetAddress(pcscf);
-                        } catch (IllegalArgumentException e) {
-                            throw new UnknownHostException("Non-numeric pcscf addr=" + pcscf);
-                        }
-                        if (!ia.isAnyLocalAddress()) {
-                            linkProperties.addPcscfServer(ia);
-                        } else {
-                            log("bad address in PCSCF");
-                        }
+                if (response.getPcscfAddresses().size() > 0) {
+                    for (InetAddress pcscf : response.getPcscfAddresses()) {
+                        linkProperties.addPcscfServer(pcscf);
                     }
                 }
 
-                for (InetAddress gateway : response.getGateways()) {
+                for (InetAddress gateway : response.getGatewayAddresses()) {
                     // Allow 0.0.0.0 or :: as a gateway;
                     // this indicates a point-to-point interface.
                     linkProperties.addRoute(new RouteInfo(gateway));
@@ -1347,7 +1412,7 @@ public class DataConnection extends StateMachine {
         if (result != SetupResult.SUCCESS) {
             if (DBG) {
                 log("setLinkProperties: error clearing LinkProperties status="
-                        + response.getStatus() + " result=" + result);
+                        + response.getCause() + " result=" + result);
             }
             linkProperties.clear();
         }
@@ -1402,7 +1467,8 @@ public class DataConnection extends StateMachine {
             if (DBG) log("DcDefaultState: enter");
 
             // Register for DRS or RAT change
-            mPhone.getServiceStateTracker().registerForDataRegStateOrRatChanged(getHandler(),
+            mPhone.getServiceStateTracker().registerForDataRegStateOrRatChanged(
+                    mTransportType, getHandler(),
                     DataConnection.EVENT_DATA_CONNECTION_DRS_OR_RAT_CHANGED, null);
 
             mPhone.getServiceStateTracker().registerForDataRoamingOn(getHandler(),
@@ -1418,7 +1484,8 @@ public class DataConnection extends StateMachine {
             if (DBG) log("DcDefaultState: exit");
 
             // Unregister for DRS or RAT change.
-            mPhone.getServiceStateTracker().unregisterForDataRegStateOrRatChanged(getHandler());
+            mPhone.getServiceStateTracker().unregisterForDataRegStateOrRatChanged(
+                    mTransportType, getHandler());
 
             mPhone.getServiceStateTracker().unregisterForDataRoamingOn(getHandler());
             mPhone.getServiceStateTracker().unregisterForDataRoamingOff(getHandler());
@@ -1499,9 +1566,10 @@ public class DataConnection extends StateMachine {
                     updateNetworkInfo();
                     updateNetworkInfoSuspendState();
                     if (mNetworkAgent != null) {
-                        mNetworkAgent.sendNetworkCapabilities(getNetworkCapabilities());
-                        mNetworkAgent.sendNetworkInfo(mNetworkInfo);
-                        mNetworkAgent.sendLinkProperties(mLinkProperties);
+                        mNetworkAgent.sendNetworkCapabilities(getNetworkCapabilities(),
+                                DataConnection.this);
+                        mNetworkAgent.sendNetworkInfo(mNetworkInfo, DataConnection.this);
+                        mNetworkAgent.sendLinkProperties(mLinkProperties, DataConnection.this);
                     }
                     break;
                 case EVENT_DATA_CONNECTION_ROAM_ON:
@@ -1509,8 +1577,9 @@ public class DataConnection extends StateMachine {
                 case EVENT_DATA_CONNECTION_OVERRIDE_CHANGED:
                     updateNetworkInfo();
                     if (mNetworkAgent != null) {
-                        mNetworkAgent.sendNetworkCapabilities(getNetworkCapabilities());
-                        mNetworkAgent.sendNetworkInfo(mNetworkInfo);
+                        mNetworkAgent.sendNetworkCapabilities(getNetworkCapabilities(),
+                                DataConnection.this);
+                        mNetworkAgent.sendNetworkInfo(mNetworkInfo, DataConnection.this);
                     }
                     break;
                 case EVENT_KEEPALIVE_START_REQUEST:
@@ -1518,11 +1587,6 @@ public class DataConnection extends StateMachine {
                     if (mNetworkAgent != null) {
                         mNetworkAgent.onSocketKeepaliveEvent(
                                 msg.arg1, SocketKeepalive.ERROR_INVALID_NETWORK);
-                    }
-                    break;
-                case EVENT_DATA_CONNECTION_DDS_SWITCHED:
-                    if (mNetworkAgent != null) {
-                        mNetworkAgent.sendNetworkScore(50);
                     }
                     break;
 
@@ -1611,6 +1675,9 @@ public class DataConnection extends StateMachine {
                     mApnSetting != null ? (long) mApnSetting.getApnTypeBitmask() : 0L,
                     mApnSetting != null
                         ? mApnSetting.canHandleType(ApnSetting.TYPE_DEFAULT) : false);
+            if (mHandoverState == HANDOVER_STATE_BEING_TRANSFERRED) {
+                mHandoverState = HANDOVER_STATE_COMPLETED;
+            }
 
             if (mConnectionParams != null) {
                 if (DBG) {
@@ -1708,6 +1775,7 @@ public class DataConnection extends StateMachine {
                     mApnSetting != null ? (long) mApnSetting.getApnTypeBitmask() : 0L,
                     mApnSetting != null
                         ? mApnSetting.canHandleType(ApnSetting.TYPE_DEFAULT) : false);
+            setHandoverState(HANDOVER_STATE_IDLE);
         }
         @Override
         public boolean processMessage(Message msg) {
@@ -1853,6 +1921,9 @@ public class DataConnection extends StateMachine {
             }
             misc.subscriberId = mPhone.getSubscriberId();
 
+            // set skip464xlat if it is not default otherwise
+            misc.skip464xlat = shouldSkip464Xlat();
+
             mRestrictedNetworkOverride = shouldRestrictNetwork();
             mUnmeteredUseOnly = isUnmeteredUseOnly();
 
@@ -1866,27 +1937,40 @@ public class DataConnection extends StateMachine {
                 // If this is a data setup for handover, we need to reuse the existing network agent
                 // instead of creating a new one. This should be transparent to connectivity
                 // service.
-                DcTracker dcTracker = getHandoverDcTracker();
+                DcTracker dcTracker = mPhone.getDcTracker(getHandoverSourceTransport());
                 DataConnection dc = dcTracker.getDataConnectionByApnType(
                         mConnectionParams.mApnContext.getApnType());
+                // It's possible that the source data connection has been disconnected by the modem
+                // already. If not, set its handover state to completed.
                 if (dc != null) {
-                    mNetworkAgent = dc.getNetworkAgent();
-                    if (mNetworkAgent != null) {
-                        mNetworkAgent.sendNetworkCapabilities(getNetworkCapabilities());
-                        mNetworkAgent.sendLinkProperties(mLinkProperties);
-                    } else {
-                        loge("Failed to get network agent from original data connection " + dc);
-                    }
+                    // Transfer network agent from the original data connection as soon as the
+                    // new handover data connection is connected.
+                    dc.setHandoverState(HANDOVER_STATE_COMPLETED);
+                }
+
+                if (mHandoverSourceNetworkAgent != null) {
+                    log("Transfer network agent successfully.");
+                    mNetworkAgent = mHandoverSourceNetworkAgent;
+                    mNetworkAgent.acquireOwnership(DataConnection.this, mTransportType);
+                    mNetworkAgent.sendNetworkCapabilities(getNetworkCapabilities(),
+                            DataConnection.this);
+                    mNetworkAgent.sendLinkProperties(mLinkProperties, DataConnection.this);
+                    mHandoverSourceNetworkAgent = null;
                 } else {
-                    loge("Cannot find the data connection for handover.");
+                    loge("Failed to get network agent from original data connection");
+                    return;
                 }
             } else {
                 mScore = calculateScore();
-                mNetworkAgent = new DcNetworkAgent(getHandler().getLooper(), mPhone.getContext(),
-                        "DcNetworkAgent", mNetworkInfo, getNetworkCapabilities(), mLinkProperties,
-                        mScore, misc);
+                final NetworkFactory factory = PhoneFactory.getNetworkFactory(
+                        mPhone.getPhoneId());
+                final int factorySerialNumber = (null == factory)
+                        ? NetworkFactory.SerialNumber.NONE : factory.getSerialNumber();
+                mNetworkAgent = DcNetworkAgent.createDcNetworkAgent(DataConnection.this,
+                        mPhone, mNetworkInfo, mScore, misc, factorySerialNumber, mTransportType);
             }
-            if (mDataServiceManager.getTransportType() == TransportType.WWAN) {
+
+            if (mTransportType == AccessNetworkConstants.TRANSPORT_TYPE_WWAN) {
                 mPhone.mCi.registerForNattKeepaliveStatus(
                         getHandler(), DataConnection.EVENT_KEEPALIVE_STATUS, null);
                 mPhone.mCi.registerForLceInfo(
@@ -1910,24 +1994,27 @@ public class DataConnection extends StateMachine {
             mPhone.getCallTracker().unregisterForVoiceCallStarted(getHandler());
             mPhone.getCallTracker().unregisterForVoiceCallEnded(getHandler());
 
-            mNetworkInfo.setDetailedState(NetworkInfo.DetailedState.DISCONNECTED,
-                    reason, mNetworkInfo.getExtraInfo());
+            // If the data connection is being handover to other transport, we should not notify
+            // disconnected to connectivity service.
+            if (mHandoverState != HANDOVER_STATE_BEING_TRANSFERRED) {
+                mNetworkInfo.setDetailedState(NetworkInfo.DetailedState.DISCONNECTED,
+                        reason, mNetworkInfo.getExtraInfo());
+            }
 
-            if (mDataServiceManager.getTransportType() == TransportType.WWAN) {
+            if (mTransportType == AccessNetworkConstants.TRANSPORT_TYPE_WWAN) {
                 mPhone.mCi.unregisterForNattKeepaliveStatus(getHandler());
                 mPhone.mCi.unregisterForLceInfo(getHandler());
             }
+
+            // If we are still owning this agent, then we should inform connectivity service the
+            // data connection is disconnected. If we don't own this agent at this point, that means
+            // it has been transferred to the new data connection for IWLAN data handover case.
             if (mNetworkAgent != null) {
-                // We do not want to update the network info if this is a handover. For all other
-                // cases we need to update connectivity service with the latest network info.
-                //
-                // For handover, the network agent is transferred to the other data connection.
-                if (mDisconnectParams == null
-                        || mDisconnectParams.mReleaseType != DcTracker.RELEASE_TYPE_HANDOVER) {
-                    mNetworkAgent.sendNetworkInfo(mNetworkInfo);
-                }
-                mNetworkAgent = null;
+                mNetworkAgent.sendNetworkInfo(mNetworkInfo, DataConnection.this);
+                mNetworkAgent.releaseOwnership(DataConnection.this);
             }
+            mNetworkAgent = null;
+
             TelephonyMetrics.getInstance().writeRilDataCallEvent(mPhone.getPhoneId(),
                     mCid, mApnSetting.getApnTypeBitmask(), RilDataCall.State.DISCONNECTED);
         }
@@ -1945,7 +2032,8 @@ public class DataConnection extends StateMachine {
                     // TODO (b/118347948): evaluate if it's still needed after assigning
                     // different scores to different Cellular network.
                     mDisabledApnTypeBitMask &= ~cp.mApnContext.getApnTypeBitmask();
-                    mNetworkAgent.sendNetworkCapabilities(getNetworkCapabilities());
+                    mNetworkAgent.sendNetworkCapabilities(getNetworkCapabilities(),
+                            DataConnection.this);
                     if (DBG) {
                         log("DcActiveState: EVENT_CONNECT cp=" + cp + " dc=" + DataConnection.this);
                     }
@@ -1977,7 +2065,8 @@ public class DataConnection extends StateMachine {
                             // TODO (b/118347948): evaluate if it's still needed after assigning
                             // different scores to different Cellular network.
                             mDisabledApnTypeBitMask |= dp.mApnContext.getApnTypeBitmask();
-                            mNetworkAgent.sendNetworkCapabilities(getNetworkCapabilities());
+                            mNetworkAgent.sendNetworkCapabilities(getNetworkCapabilities(),
+                                    DataConnection.this);
                             notifyDisconnectCompleted(dp, false);
                         }
                     } else {
@@ -2017,8 +2106,9 @@ public class DataConnection extends StateMachine {
                 case EVENT_DATA_CONNECTION_OVERRIDE_CHANGED: {
                     updateNetworkInfo();
                     if (mNetworkAgent != null) {
-                        mNetworkAgent.sendNetworkCapabilities(getNetworkCapabilities());
-                        mNetworkAgent.sendNetworkInfo(mNetworkInfo);
+                        mNetworkAgent.sendNetworkCapabilities(getNetworkCapabilities(),
+                                DataConnection.this);
+                        mNetworkAgent.sendNetworkInfo(mNetworkInfo, DataConnection.this);
                     }
                     retVal = HANDLED;
                     break;
@@ -2033,7 +2123,7 @@ public class DataConnection extends StateMachine {
                         if (mPhone.getLceStatus() == RILConstants.LCE_ACTIVE) {
                             nc.setLinkDownstreamBandwidthKbps(lce.downlinkCapacityKbps);
                             if (mNetworkAgent != null) {
-                                mNetworkAgent.sendNetworkCapabilities(nc);
+                                mNetworkAgent.sendNetworkCapabilities(nc, DataConnection.this);
                             }
                         }
                     }
@@ -2045,8 +2135,9 @@ public class DataConnection extends StateMachine {
                     updateNetworkInfo();
                     updateNetworkInfoSuspendState();
                     if (mNetworkAgent != null) {
-                        mNetworkAgent.sendNetworkCapabilities(getNetworkCapabilities());
-                        mNetworkAgent.sendNetworkInfo(mNetworkInfo);
+                        mNetworkAgent.sendNetworkCapabilities(getNetworkCapabilities(),
+                                DataConnection.this);
+                        mNetworkAgent.sendNetworkInfo(mNetworkInfo, DataConnection.this);
                     }
                     retVal = HANDLED;
                     break;
@@ -2055,7 +2146,7 @@ public class DataConnection extends StateMachine {
                     KeepalivePacketData pkt = (KeepalivePacketData) msg.obj;
                     int slotId = msg.arg1;
                     int intervalMillis = msg.arg2 * 1000;
-                    if (mDataServiceManager.getTransportType() == TransportType.WWAN) {
+                    if (mTransportType == AccessNetworkConstants.TRANSPORT_TYPE_WWAN) {
                         mPhone.mCi.startNattKeepalive(
                                 DataConnection.this.mCid, pkt, intervalMillis,
                                 DataConnection.this.obtainMessage(
@@ -2158,7 +2249,7 @@ public class DataConnection extends StateMachine {
                             nc.setLinkUpstreamBandwidthKbps(lce.uplinkCapacityKbps);
                         }
                         if (mNetworkAgent != null) {
-                            mNetworkAgent.sendNetworkCapabilities(nc);
+                            mNetworkAgent.sendNetworkCapabilities(nc, DataConnection.this);
                         }
                     }
                     retVal = HANDLED;
@@ -2179,7 +2270,8 @@ public class DataConnection extends StateMachine {
                         // (see {@link NetworkCapabilities}) once we add it to the network, we can't
                         // remove it through the entire life cycle of the connection.
                         mRestrictedNetworkOverride = false;
-                        mNetworkAgent.sendNetworkCapabilities(getNetworkCapabilities());
+                        mNetworkAgent.sendNetworkCapabilities(getNetworkCapabilities(),
+                                DataConnection.this);
                     }
 
                     // If the data does need to be unmetered use only (e.g. users turn on data, or
@@ -2189,7 +2281,8 @@ public class DataConnection extends StateMachine {
                     // capabilities.)
                     if (mUnmeteredUseOnly && !isUnmeteredUseOnly()) {
                         mUnmeteredUseOnly = false;
-                        mNetworkAgent.sendNetworkCapabilities(getNetworkCapabilities());
+                        mNetworkAgent.sendNetworkCapabilities(getNetworkCapabilities(),
+                                DataConnection.this);
                     }
 
                     retVal = HANDLED;
@@ -2325,209 +2418,6 @@ public class DataConnection extends StateMachine {
     private DcDisconnectionErrorCreatingConnection mDisconnectingErrorCreatingConnection =
                 new DcDisconnectionErrorCreatingConnection();
 
-
-    private class DcNetworkAgent extends NetworkAgent {
-
-        private NetworkCapabilities mNetworkCapabilities;
-
-        public final DcKeepaliveTracker keepaliveTracker = new DcKeepaliveTracker();
-
-        public DcNetworkAgent(Looper l, Context c, String TAG, NetworkInfo ni,
-                NetworkCapabilities nc, LinkProperties lp, int score, NetworkMisc misc) {
-            super(l, c, TAG, ni, nc, lp, score, misc);
-            mNetCapsLocalLog.log("New network agent created. capabilities=" + nc);
-            mNetworkCapabilities = nc;
-        }
-
-        @Override
-        protected void unwanted() {
-            if (mNetworkAgent != this) {
-                log("DcNetworkAgent: unwanted found mNetworkAgent=" + mNetworkAgent +
-                        ", which isn't me.  Aborting unwanted");
-                return;
-            }
-            // this can only happen if our exit has been called - we're already disconnected
-            if (mApnContexts == null) return;
-            for (ConnectionParams cp : mApnContexts.values()) {
-                final ApnContext apnContext = cp.mApnContext;
-                final Pair<ApnContext, Integer> pair =
-                        new Pair<ApnContext, Integer>(apnContext, cp.mConnectionGeneration);
-                log("DcNetworkAgent: [unwanted]: disconnect apnContext=" + apnContext);
-                Message msg = mDct.obtainMessage(DctConstants.EVENT_DISCONNECT_DONE, pair);
-                DisconnectParams dp = new DisconnectParams(apnContext, apnContext.getReason(),
-                        DcTracker.RELEASE_TYPE_DETACH, msg);
-                DataConnection.this.sendMessage(DataConnection.this.
-                        obtainMessage(EVENT_DISCONNECT, dp));
-            }
-        }
-
-        @Override
-        protected void pollLceData() {
-            if (mPhone.getLceStatus() == RILConstants.LCE_ACTIVE     // active LCE service
-                    && mDataServiceManager.getTransportType() == TransportType.WWAN) {
-                mPhone.mCi.pullLceData(
-                        DataConnection.this.obtainMessage(EVENT_BW_REFRESH_RESPONSE));
-            }
-        }
-
-        @Override
-        protected void networkStatus(int status, String redirectUrl) {
-            log("validation status: " + status + " with redirection URL: " + redirectUrl);
-            Message msg = mDct.obtainMessage(DctConstants.EVENT_NETWORK_STATUS_CHANGED,
-                    status, 0, redirectUrl);
-            msg.sendToTarget();
-        }
-
-        @Override
-        public void sendNetworkCapabilities(NetworkCapabilities networkCapabilities) {
-            if (!networkCapabilities.equals(mNetworkCapabilities)) {
-                String logStr = "Changed from " + mNetworkCapabilities + " to "
-                        + networkCapabilities + ", Data RAT="
-                        + mPhone.getServiceState().getRilDataRadioTechnology()
-                        + ", mApnSetting=" + mApnSetting;
-                mNetCapsLocalLog.log(logStr);
-                log(logStr);
-                mNetworkCapabilities = networkCapabilities;
-            }
-            super.sendNetworkCapabilities(networkCapabilities);
-        }
-
-        @Override
-        protected void startSocketKeepalive(Message msg) {
-            if (msg.obj instanceof NattKeepalivePacketData) {
-                DataConnection.this.obtainMessage(EVENT_KEEPALIVE_START_REQUEST,
-                        msg.arg1, msg.arg2, msg.obj).sendToTarget();
-            } else {
-                onSocketKeepaliveEvent(msg.arg1, SocketKeepalive.ERROR_HARDWARE_UNSUPPORTED);
-            }
-        }
-
-        @Override
-        protected void stopSocketKeepalive(Message msg) {
-            DataConnection.this.obtainMessage(EVENT_KEEPALIVE_STOP_REQUEST,
-                    msg.arg1, msg.arg2, msg.obj).sendToTarget();
-        }
-
-        private class DcKeepaliveTracker {
-            private class KeepaliveRecord {
-                public int slotId;
-                public int currentStatus;
-
-                KeepaliveRecord(int slotId, int status) {
-                    this.slotId = slotId;
-                    this.currentStatus = status;
-                }
-            };
-
-            private final SparseArray<KeepaliveRecord> mKeepalives = new SparseArray();
-
-            int getHandleForSlot(int slotId) {
-                for (int i = 0; i < mKeepalives.size(); i++) {
-                    KeepaliveRecord kr = mKeepalives.valueAt(i);
-                    if (kr.slotId == slotId) return mKeepalives.keyAt(i);
-                }
-                return -1;
-            }
-
-            int keepaliveStatusErrorToPacketKeepaliveError(int error) {
-                switch(error) {
-                    case KeepaliveStatus.ERROR_NONE:
-                        return SocketKeepalive.SUCCESS;
-                    case KeepaliveStatus.ERROR_UNSUPPORTED:
-                        return SocketKeepalive.ERROR_HARDWARE_UNSUPPORTED;
-                    case KeepaliveStatus.ERROR_NO_RESOURCES:
-                    case KeepaliveStatus.ERROR_UNKNOWN:
-                    default:
-                        return SocketKeepalive.ERROR_HARDWARE_ERROR;
-                }
-            }
-
-            void handleKeepaliveStarted(final int slot, KeepaliveStatus ks) {
-                switch (ks.statusCode) {
-                    case KeepaliveStatus.STATUS_INACTIVE:
-                        DcNetworkAgent.this.onSocketKeepaliveEvent(slot,
-                                keepaliveStatusErrorToPacketKeepaliveError(ks.errorCode));
-                        break;
-                    case KeepaliveStatus.STATUS_ACTIVE:
-                        DcNetworkAgent.this.onSocketKeepaliveEvent(
-                                slot, SocketKeepalive.SUCCESS);
-                        // fall through to add record
-                    case KeepaliveStatus.STATUS_PENDING:
-                        log("Adding keepalive handle="
-                                + ks.sessionHandle + " slot = " + slot);
-                        mKeepalives.put(ks.sessionHandle,
-                                new KeepaliveRecord(
-                                        slot, ks.statusCode));
-                        break;
-                    default:
-                        loge("Invalid KeepaliveStatus Code: " + ks.statusCode);
-                        break;
-                }
-            }
-
-            void handleKeepaliveStatus(KeepaliveStatus ks) {
-                final KeepaliveRecord kr;
-                kr = mKeepalives.get(ks.sessionHandle);
-
-                if (kr == null) {
-                    // If there is no slot for the session handle, we received an event
-                    // for a different data connection. This is not an error because the
-                    // keepalive session events are broadcast to all listeners.
-                    log("Discarding keepalive event for different data connection:" + ks);
-                    return;
-                }
-                // Switch on the current state, to see what we do with the status update
-                switch (kr.currentStatus) {
-                    case KeepaliveStatus.STATUS_INACTIVE:
-                        loge("Inactive Keepalive received status!");
-                        DcNetworkAgent.this.onSocketKeepaliveEvent(
-                                kr.slotId, SocketKeepalive.ERROR_HARDWARE_ERROR);
-                        break;
-                    case KeepaliveStatus.STATUS_PENDING:
-                        switch (ks.statusCode) {
-                            case KeepaliveStatus.STATUS_INACTIVE:
-                                DcNetworkAgent.this.onSocketKeepaliveEvent(kr.slotId,
-                                        keepaliveStatusErrorToPacketKeepaliveError(ks.errorCode));
-                                kr.currentStatus = KeepaliveStatus.STATUS_INACTIVE;
-                                mKeepalives.remove(ks.sessionHandle);
-                                break;
-                            case KeepaliveStatus.STATUS_ACTIVE:
-                                log("Pending Keepalive received active status!");
-                                kr.currentStatus = KeepaliveStatus.STATUS_ACTIVE;
-                                DcNetworkAgent.this.onSocketKeepaliveEvent(
-                                        kr.slotId, SocketKeepalive.SUCCESS);
-                                break;
-                            case KeepaliveStatus.STATUS_PENDING:
-                                loge("Invalid unsolicied Keepalive Pending Status!");
-                                break;
-                            default:
-                                loge("Invalid Keepalive Status received, " + ks.statusCode);
-                        }
-                        break;
-                    case KeepaliveStatus.STATUS_ACTIVE:
-                        switch (ks.statusCode) {
-                            case KeepaliveStatus.STATUS_INACTIVE:
-                                loge("Keepalive received stopped status!");
-                                DcNetworkAgent.this.onSocketKeepaliveEvent(
-                                        kr.slotId, SocketKeepalive.SUCCESS);
-                                kr.currentStatus = KeepaliveStatus.STATUS_INACTIVE;
-                                mKeepalives.remove(ks.sessionHandle);
-                                break;
-                            case KeepaliveStatus.STATUS_PENDING:
-                            case KeepaliveStatus.STATUS_ACTIVE:
-                                loge("Active Keepalive received invalid status!");
-                                break;
-                            default:
-                                loge("Invalid Keepalive Status received, " + ks.statusCode);
-                        }
-                        break;
-                    default:
-                        loge("Invalid Keepalive Status received, " + kr.currentStatus);
-                }
-            }
-        };
-    }
-
     /**
      * Bring up a connection to the apn and return an AsyncResult in onCompletedMsg.
      * Used for cellular networks that use Access Point Names (APN) such
@@ -2592,7 +2482,7 @@ public class DataConnection extends StateMachine {
      */
     public void tearDownAll(String reason, @ReleaseNetworkType int releaseType,
                             Message onCompletedMsg) {
-        if (DBG) log("tearDownAll: reason=" + reason + " onCompletedMsg=" + onCompletedMsg);
+        if (DBG) log("tearDownAll: reason=" + reason + ", releaseType=" + releaseType);
         sendMessage(DataConnection.EVENT_DISCONNECT_ALL,
                 new DisconnectParams(null, reason, releaseType, onCompletedMsg));
     }
@@ -2671,8 +2561,14 @@ public class DataConnection extends StateMachine {
         return new ArrayList<>(mApnContexts.keySet());
     }
 
-    public DcNetworkAgent getNetworkAgent() {
+    /** Get the network agent of the data connection */
+    @Nullable
+    DcNetworkAgent getNetworkAgent() {
         return mNetworkAgent;
+    }
+
+    void setHandoverState(@HandoverState int state) {
+        mHandoverState = state;
     }
 
     /**
@@ -2817,6 +2713,12 @@ public class DataConnection extends StateMachine {
         return "{" + toStringSimple() + " mApnContexts=" + mApnContexts + "}";
     }
 
+    /** Check if the device is connected to NR 5G Non-Standalone network. */
+    private boolean isNRConnected() {
+        return mPhone.getServiceState().getNrState()
+                == NetworkRegistrationInfo.NR_STATE_CONNECTED;
+    }
+
     private void dumpToLog() {
         dump(null, new PrintWriter(new StringWriter(0)) {
             @Override
@@ -2838,7 +2740,7 @@ public class DataConnection extends StateMachine {
         mScore = calculateScore();
         if (oldScore != mScore) {
             log("Updating score from " + oldScore + " to " + mScore);
-            mNetworkAgent.sendNetworkScore(mScore);
+            mNetworkAgent.sendNetworkScore(mScore, this);
         }
     }
 
@@ -2876,9 +2778,10 @@ public class DataConnection extends StateMachine {
         super.dump(fd, pw, args);
         pw.flush();
         pw.increaseIndent();
+        pw.println("transport type="
+                + AccessNetworkConstants.transportTypeToString(mTransportType));
         pw.println("mApnContexts.size=" + mApnContexts.size());
         pw.println("mApnContexts=" + mApnContexts);
-        pw.println("mDataConnectionTracker=" + mDct);
         pw.println("mApnSetting=" + mApnSetting);
         pw.println("mTag=" + mTag);
         pw.println("mCid=" + mCid);
@@ -2889,6 +2792,7 @@ public class DataConnection extends StateMachine {
         pw.println("mLinkProperties=" + mLinkProperties);
         pw.flush();
         pw.println("mDataRegState=" + mDataRegState);
+        pw.println("mHandoverState=" + mHandoverState);
         pw.println("mRilRat=" + mRilRat);
         pw.println("mNetworkCapabilities=" + getNetworkCapabilities());
         pw.println("mCreateTime=" + TimeUtils.logTimeOfDay(mCreateTime));
@@ -2901,10 +2805,9 @@ public class DataConnection extends StateMachine {
         pw.println("mInstanceNumber=" + mInstanceNumber);
         pw.println("mAc=" + mAc);
         pw.println("mScore=" + mScore);
-        pw.println("Network capabilities changed history:");
-        pw.increaseIndent();
-        mNetCapsLocalLog.dump(fd, pw, args);
-        pw.decreaseIndent();
+        if (mNetworkAgent != null) {
+            mNetworkAgent.dump(fd, pw, args);
+        }
         pw.decreaseIndent();
         pw.println();
         pw.flush();

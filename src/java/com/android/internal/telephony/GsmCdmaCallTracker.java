@@ -16,6 +16,7 @@
 
 package com.android.internal.telephony;
 
+import android.annotation.UnsupportedAppUsage;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
@@ -79,18 +80,24 @@ public class GsmCdmaCallTracker extends CallTracker {
     private ArrayList<GsmCdmaConnection> mDroppedDuringPoll =
             new ArrayList<GsmCdmaConnection>(MAX_CONNECTIONS_GSM);
 
+    @UnsupportedAppUsage
     public GsmCdmaCall mRingingCall = new GsmCdmaCall(this);
     // A call that is ringing or (call) waiting
+    @UnsupportedAppUsage
     public GsmCdmaCall mForegroundCall = new GsmCdmaCall(this);
+    @UnsupportedAppUsage
     public GsmCdmaCall mBackgroundCall = new GsmCdmaCall(this);
 
+    @UnsupportedAppUsage
     private GsmCdmaConnection mPendingMO;
     private boolean mHangupPendingMO;
 
+    @UnsupportedAppUsage
     private GsmCdmaPhone mPhone;
 
     private boolean mDesiredMute = false;    // false = mute off
 
+    @UnsupportedAppUsage
     public PhoneConstants.State mState = PhoneConstants.State.IDLE;
 
     private TelephonyMetrics mMetrics = TelephonyMetrics.getInstance();
@@ -100,6 +107,7 @@ public class GsmCdmaCallTracker extends CallTracker {
     private boolean mPendingCallInEcm;
     private boolean mIsInEmergencyCall;
     private int mPendingCallClirMode;
+    private UUSInfo mPendingCallUusInfo;
     private boolean mIsEcmTimerCanceled;
     private int m3WayCallFlashDelay;
 
@@ -174,13 +182,14 @@ public class GsmCdmaCallTracker extends CallTracker {
             // Prior to phone switch to GSM, if CDMA has any emergency call
             // data will be in disabled state, after switching to GSM enable data.
             if (mIsInEmergencyCall) {
-                mPhone.getDataEnabledSettings().setInternalDataEnabled(true);
+                EcbmHandler.getInstance().setInternalDataEnabled(true);
             }
         } else {
             mConnections = new GsmCdmaConnection[MAX_CONNECTIONS_CDMA];
             mPendingCallInEcm = false;
             mIsInEmergencyCall = false;
             mPendingCallClirMode = CommandsInterface.CLIR_DEFAULT;
+            mPendingCallUusInfo = null;
             mIsEcmTimerCanceled = false;
             m3WayCallFlashDelay = 0;
             mCi.registerForCallWaitingInfo(this, EVENT_CALL_WAITING_INFO_CDMA, null);
@@ -251,6 +260,7 @@ public class GsmCdmaCallTracker extends CallTracker {
         mCallWaitingRegistrants.remove(h);
     }
 
+    @UnsupportedAppUsage
     private void fakeHoldForegroundBeforeDial() {
         List<Connection> connCopy;
 
@@ -336,10 +346,25 @@ public class GsmCdmaCallTracker extends CallTracker {
         } else {
             // Always unmute when initiating a new call
             setMute(false);
-
-            mCi.dial(mPendingMO.getAddress(), mPendingMO.isEmergencyCall(),
-                    mPendingMO.getEmergencyNumberInfo(), mPendingMO.hasKnownUserIntentEmergency(),
-                    clirMode, uusInfo, obtainCompleteMessage());
+            boolean isPhoneInEcmMode = EcbmHandler.getInstance().isInEcm();
+            // In Ecm mode, if another emergency call is dialed, Ecm mode will not exit.
+            if(!isPhoneInEcmMode || (isPhoneInEcmMode && isEmergencyCall)) {
+                mCi.dial(mPendingMO.getAddress(), mPendingMO.isEmergencyCall(),
+                        mPendingMO.getEmergencyNumberInfo(),
+                        mPendingMO.hasKnownUserIntentEmergency(), clirMode, uusInfo,
+                        obtainCompleteMessage());
+            } else {
+                EcbmHandler emergencyHandler = EcbmHandler.getInstance();
+                try {
+                    emergencyHandler.exitEmergencyCallbackMode();
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+                emergencyHandler.setOnEcbModeExitResponse(this,EVENT_EXIT_ECM_RESPONSE_CDMA, null);
+                mPendingCallClirMode = clirMode;
+                mPendingCallUusInfo = uusInfo;
+                mPendingCallInEcm = true;
+            }
         }
 
         if (mNumberConverted) {
@@ -357,11 +382,12 @@ public class GsmCdmaCallTracker extends CallTracker {
     /**
      * Handle Ecm timer to be canceled or re-started
      */
+    @UnsupportedAppUsage
     private void handleEcmTimer(int action) {
-        mPhone.handleTimerInEmergencyCallbackMode(action);
+        EcbmHandler.getInstance().handleTimerInEmergencyCallbackMode(action);
         switch(action) {
-            case GsmCdmaPhone.CANCEL_ECM_TIMER: mIsEcmTimerCanceled = true; break;
-            case GsmCdmaPhone.RESTART_ECM_TIMER: mIsEcmTimerCanceled = false; break;
+            case EcbmHandler.CANCEL_ECM_TIMER: mIsEcmTimerCanceled = true; break;
+            case EcbmHandler.RESTART_ECM_TIMER: mIsEcmTimerCanceled = false; break;
             default:
                 Rlog.e(LOG_TAG, "handleEcmTimer, unsupported action " + action);
         }
@@ -371,6 +397,7 @@ public class GsmCdmaCallTracker extends CallTracker {
     /**
      * Disable data call when emergency call is connected
      */
+    @UnsupportedAppUsage
     private void disableDataCallInEmergencyCall(String dialString) {
         if (PhoneNumberUtils.isLocalEmergencyNumber(mPhone.getContext(), dialString)) {
             if (Phone.DEBUG_PHONE) log("disableDataCallInEmergencyCall");
@@ -381,7 +408,7 @@ public class GsmCdmaCallTracker extends CallTracker {
     //CDMA
     public void setIsInEmergencyCall() {
         mIsInEmergencyCall = true;
-        mPhone.getDataEnabledSettings().setInternalDataEnabled(false);
+        EcbmHandler.getInstance().setInternalDataEnabled(false);
         mPhone.notifyEmergencyCallRegistrants(true);
         mPhone.sendEmergencyCallStateChange(true);
     }
@@ -420,11 +447,11 @@ public class GsmCdmaCallTracker extends CallTracker {
             dialString = convertNumberIfNecessary(mPhone, dialString);
         }
 
-        boolean isPhoneInEcmMode = mPhone.isInEcm();
+        boolean isPhoneInEcmMode = EcbmHandler.getInstance().isInEcm();
 
         // Cancel Ecm timer if a second emergency call is originating in Ecm mode
         if (isPhoneInEcmMode && isEmergencyCall) {
-            handleEcmTimer(GsmCdmaPhone.CANCEL_ECM_TIMER);
+            handleEcmTimer(EcbmHandler.CANCEL_ECM_TIMER);
         }
 
         // The new call must be assigned to the foreground call.
@@ -466,8 +493,13 @@ public class GsmCdmaCallTracker extends CallTracker {
                         mPendingMO.hasKnownUserIntentEmergency(),
                         clirMode, obtainCompleteMessage());
             } else {
-                mPhone.exitEmergencyCallbackMode();
-                mPhone.setOnEcbModeExitResponse(this,EVENT_EXIT_ECM_RESPONSE_CDMA, null);
+                EcbmHandler emergencyHandler = EcbmHandler.getInstance();
+                try {
+                    emergencyHandler.exitEmergencyCallbackMode();
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+                emergencyHandler.setOnEcbModeExitResponse(this,EVENT_EXIT_ECM_RESPONSE_CDMA, null);
                 mPendingCallClirMode=clirMode;
                 mPendingCallInEcm=true;
             }
@@ -589,6 +621,7 @@ public class GsmCdmaCallTracker extends CallTracker {
         mPhone.notifyPreciseCallStateChanged();
     }
 
+    @UnsupportedAppUsage
     public void switchWaitingOrHoldingAndActive() throws CallStateException {
         // Should we bother with this check?
         if (mRingingCall.getState() == GsmCdmaCall.State.INCOMING) {
@@ -624,6 +657,7 @@ public class GsmCdmaCallTracker extends CallTracker {
         mCi.explicitCallTransfer(obtainCompleteMessage(EVENT_ECT_RESULT));
     }
 
+    @UnsupportedAppUsage
     public void clearDisconnected() {
         internalClearDisconnected();
 
@@ -708,6 +742,7 @@ public class GsmCdmaCallTracker extends CallTracker {
      * Obtain a message to use for signalling "invoke getCurrentCalls() when
      * this operation and all other pending operations are complete
      */
+    @UnsupportedAppUsage
     private Message obtainCompleteMessage() {
         return obtainCompleteMessage(EVENT_OPERATION_COMPLETE);
     }
@@ -716,6 +751,7 @@ public class GsmCdmaCallTracker extends CallTracker {
      * Obtain a message to use for signalling "invoke getCurrentCalls() when
      * this operation and all other pending operations are complete
      */
+    @UnsupportedAppUsage
     private Message obtainCompleteMessage(int what) {
         mPendingOperations++;
         mLastRelevantPoll = null;
@@ -743,6 +779,7 @@ public class GsmCdmaCallTracker extends CallTracker {
         }
     }
 
+    @UnsupportedAppUsage
     private void updatePhoneState() {
         PhoneConstants.State oldState = mState;
         if (mRingingCall.isRinging()) {
@@ -849,7 +886,7 @@ public class GsmCdmaCallTracker extends CallTracker {
 
                         // Re-start Ecm timer when an uncompleted emergency call ends
                         if (!isPhoneTypeGsm() && mIsEcmTimerCanceled) {
-                            handleEcmTimer(GsmCdmaPhone.RESTART_ECM_TIMER);
+                            handleEcmTimer(EcbmHandler.RESTART_ECM_TIMER);
                         }
 
                         try {
@@ -946,7 +983,7 @@ public class GsmCdmaCallTracker extends CallTracker {
 
                     // Re-start Ecm timer when the connected emergency call ends
                     if (mIsEcmTimerCanceled) {
-                        handleEcmTimer(GsmCdmaPhone.RESTART_ECM_TIMER);
+                        handleEcmTimer(EcbmHandler.RESTART_ECM_TIMER);
                     }
                     // If emergency call is not going through while dialing
                     checkAndEnableDataCallAfterEmergencyCallDropped();
@@ -1201,7 +1238,7 @@ public class GsmCdmaCallTracker extends CallTracker {
         if (conn == mPendingMO) {
             // Re-start Ecm timer when an uncompleted emergency call ends
             if (mIsEcmTimerCanceled) {
-                handleEcmTimer(GsmCdmaPhone.RESTART_ECM_TIMER);
+                handleEcmTimer(EcbmHandler.RESTART_ECM_TIMER);
             }
 
             // Allow HANGUP to RIL during pending MO is present
@@ -1258,6 +1295,7 @@ public class GsmCdmaCallTracker extends CallTracker {
 
     //***** Called from GsmCdmaPhone
 
+    @UnsupportedAppUsage
     public void setMute(boolean mute) {
         mDesiredMute = mute;
         mCi.setMute(mDesiredMute, null);
@@ -1523,9 +1561,9 @@ public class GsmCdmaCallTracker extends CallTracker {
                     CellLocation loc = mPhone.getCellLocation();
                     int cid = -1;
                     if (loc != null) {
-                        if (isPhoneTypeGsm()) {
+                        if (loc instanceof GsmCellLocation) {
                             cid = ((GsmCellLocation)loc).getCid();
-                        } else {
+                        } else if (loc instanceof CdmaCellLocation) {
                             cid = ((CdmaCellLocation)loc).getBaseStationId();
                         }
                     }
@@ -1560,20 +1598,23 @@ public class GsmCdmaCallTracker extends CallTracker {
             break;
 
             case EVENT_EXIT_ECM_RESPONSE_CDMA:
-                if (!isPhoneTypeGsm()) {
+                if (mPendingCallInEcm) {
                     // no matter the result, we still do the same here
-                    if (mPendingCallInEcm) {
+                    if (isPhoneTypeGsm()) {
+                        mCi.dial(mPendingMO.getAddress(), mPendingMO.isEmergencyCall(),
+                                mPendingMO.getEmergencyNumberInfo(),
+                                mPendingMO.hasKnownUserIntentEmergency(), mPendingCallClirMode,
+                                mPendingCallUusInfo, obtainCompleteMessage());
+
+                    } else {
                         mCi.dial(mPendingMO.getAddress(), mPendingMO.isEmergencyCall(),
                                 mPendingMO.getEmergencyNumberInfo(),
                                 mPendingMO.hasKnownUserIntentEmergency(),
                                 mPendingCallClirMode, obtainCompleteMessage());
-                        mPendingCallInEcm = false;
                     }
-                    mPhone.unsetOnEcbModeExitResponse(this);
-                } else {
-                    throw new RuntimeException("unexpected event " + msg.what + " not handled by " +
-                            "phone type " + mPhone.getPhoneType());
                 }
+                EcbmHandler.getInstance().unsetOnEcbModeExitResponse(this);
+                mPendingCallInEcm = false;
                 break;
 
             case EVENT_CALL_WAITING_INFO_CDMA:
@@ -1659,13 +1700,13 @@ public class GsmCdmaCallTracker extends CallTracker {
     private void checkAndEnableDataCallAfterEmergencyCallDropped() {
         if (mIsInEmergencyCall) {
             mIsInEmergencyCall = false;
-            boolean inEcm = mPhone.isInEcm();
+            boolean inEcm = EcbmHandler.getInstance().isInEcm();
             if (Phone.DEBUG_PHONE) {
                 log("checkAndEnableDataCallAfterEmergencyCallDropped,inEcm=" + inEcm);
             }
             if (!inEcm) {
                 // Re-initiate data connection
-                mPhone.getDataEnabledSettings().setInternalDataEnabled(true);
+                EcbmHandler.getInstance().setInternalDataEnabled(true);
                 mPhone.notifyEmergencyCallRegistrants(false);
             }
             mPhone.sendEmergencyCallStateChange(false);
@@ -1727,14 +1768,17 @@ public class GsmCdmaCallTracker extends CallTracker {
                 .count() > 0);
     }
 
+    @UnsupportedAppUsage
     private boolean isPhoneTypeGsm() {
         return mPhone.getPhoneType() == PhoneConstants.PHONE_TYPE_GSM;
     }
 
+    @UnsupportedAppUsage
     public GsmCdmaPhone getPhone() {
         return mPhone;
     }
 
+    @UnsupportedAppUsage
     @Override
     protected void log(String msg) {
         Rlog.d(LOG_TAG, "[" + mPhone.getPhoneId() + "] " + msg);

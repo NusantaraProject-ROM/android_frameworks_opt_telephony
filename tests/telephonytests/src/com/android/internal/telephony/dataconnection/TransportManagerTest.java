@@ -29,8 +29,8 @@ import android.os.AsyncResult;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Message;
+import android.telephony.AccessNetworkConstants;
 import android.telephony.AccessNetworkConstants.AccessNetworkType;
-import android.telephony.AccessNetworkConstants.TransportType;
 import android.telephony.data.ApnSetting;
 import android.test.suitebuilder.annotation.SmallTest;
 
@@ -102,6 +102,9 @@ public class TransportManagerTest extends TelephonyTest {
         // Verify handover needed event was not sent
         verify(mTestHandler, never()).sendMessageAtTime(any(Message.class), anyLong());
 
+        assertEquals(AccessNetworkConstants.TRANSPORT_TYPE_WWAN,
+                mTransportManager.getCurrentTransport(ApnSetting.TYPE_IMS));
+
         // Now change the order of qualified networks by putting IWLAN first
         networkList = new ArrayList<>(Arrays.asList(
                 new QualifiedNetworks(ApnSetting.TYPE_IMS,
@@ -121,7 +124,12 @@ public class TransportManagerTest extends TelephonyTest {
         AsyncResult ar = (AsyncResult) message.obj;
         HandoverParams params = (HandoverParams) ar.result;
         assertEquals(ApnSetting.TYPE_IMS, params.apnType);
-        assertEquals(TransportType.WLAN, params.targetTransport);
+        assertEquals(AccessNetworkConstants.TRANSPORT_TYPE_WLAN, params.targetTransport);
+
+        // Notify handover succeeded.
+        params.callback.onCompleted(true);
+        assertEquals(AccessNetworkConstants.TRANSPORT_TYPE_WLAN,
+                mTransportManager.getCurrentTransport(ApnSetting.TYPE_IMS));
 
         // Now change the order of qualified networks by putting UTRAN first
         networkList = new ArrayList<>(Arrays.asList(
@@ -142,7 +150,15 @@ public class TransportManagerTest extends TelephonyTest {
         ar = (AsyncResult) message.obj;
         params = (HandoverParams) ar.result;
         assertEquals(ApnSetting.TYPE_IMS, params.apnType);
-        assertEquals(TransportType.WWAN, params.targetTransport);
+        assertEquals(AccessNetworkConstants.TRANSPORT_TYPE_WWAN, params.targetTransport);
+
+        // The transport should not change before handover complete callback is called.
+        assertEquals(AccessNetworkConstants.TRANSPORT_TYPE_WLAN,
+                mTransportManager.getCurrentTransport(ApnSetting.TYPE_IMS));
+        // Notify handover succeeded.
+        params.callback.onCompleted(true);
+        assertEquals(AccessNetworkConstants.TRANSPORT_TYPE_WWAN,
+                mTransportManager.getCurrentTransport(ApnSetting.TYPE_IMS));
     }
 
     @Test

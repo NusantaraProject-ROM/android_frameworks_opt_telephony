@@ -16,6 +16,7 @@
 
 package com.android.internal.telephony.uicc;
 
+import android.annotation.UnsupportedAppUsage;
 import android.content.Context;
 import android.content.res.Resources;
 import android.os.AsyncResult;
@@ -24,7 +25,6 @@ import android.os.PersistableBundle;
 import android.telephony.CarrierConfigManager;
 import android.telephony.PhoneNumberUtils;
 import android.telephony.Rlog;
-import android.telephony.ServiceState;
 import android.telephony.SmsMessage;
 import android.telephony.SubscriptionInfo;
 import android.text.TextUtils;
@@ -40,6 +40,7 @@ import java.io.FileDescriptor;
 import java.io.PrintWriter;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 
 /**
  * {@hide}
@@ -53,6 +54,7 @@ public class SIMRecords extends IccRecords {
 
     // ***** Instance Variables
 
+    @UnsupportedAppUsage
     VoiceMailConstants mVmConfig;
 
     // ***** Cached SIM State; cleared on channel close
@@ -72,18 +74,21 @@ public class SIMRecords extends IccRecords {
     private byte[] mCphsInfo = null;
     boolean mCspPlmnEnabled = true;
 
+    @UnsupportedAppUsage
     byte[] mEfMWIS = null;
+    @UnsupportedAppUsage
     byte[] mEfCPHS_MWI =null;
+    @UnsupportedAppUsage
     byte[] mEfCff = null;
+    @UnsupportedAppUsage
     byte[] mEfCfis = null;
 
+    @UnsupportedAppUsage
     byte[] mEfLi = null;
+    @UnsupportedAppUsage
     byte[] mEfPl = null;
 
-    int mSpnDisplayCondition;
-    // Numeric network codes listed in TS 51.011 EF[SPDI]
-    ArrayList<String> mSpdiNetworks = null;
-
+    @UnsupportedAppUsage
     UsimServiceTable mUsimServiceTable;
 
     @Override
@@ -221,11 +226,10 @@ public class SIMRecords extends IccRecords {
         log("setting0 mMncLength" + mMncLength);
         mIccId = null;
         mFullIccId = null;
-        // -1 means no EF_SPN found; treat accordingly.
-        mSpnDisplayCondition = -1;
+        mCarrierNameDisplayCondition = DEFAULT_CARRIER_NAME_DISPLAY_CONDITION;
         mEfMWIS = null;
         mEfCPHS_MWI = null;
-        mSpdiNetworks = null;
+        mSpdi = null;
         mPnnHomeName = null;
         mGid1 = null;
         mGid2 = null;
@@ -253,6 +257,7 @@ public class SIMRecords extends IccRecords {
 
     //***** Public Methods
 
+    @UnsupportedAppUsage
     @Override
     public String getMsisdnNumber() {
         return mMsisdn;
@@ -263,6 +268,7 @@ public class SIMRecords extends IccRecords {
         return mUsimServiceTable;
     }
 
+    @UnsupportedAppUsage
     private int getExtFromEf(int ef) {
         int ext;
         switch (ef) {
@@ -318,6 +324,7 @@ public class SIMRecords extends IccRecords {
         return mMsisdnTag;
     }
 
+    @UnsupportedAppUsage
     @Override
     public String getVoiceMailNumber() {
         return mVoiceMailNum;
@@ -497,6 +504,7 @@ public class SIMRecords extends IccRecords {
     /**
      * {@inheritDoc}
      */
+    @UnsupportedAppUsage
     @Override
     public void setVoiceCallForwardingFlag(int line, boolean enable, String dialNumber) {
 
@@ -579,6 +587,7 @@ public class SIMRecords extends IccRecords {
     /**
      * {@inheritDoc}
      */
+    @UnsupportedAppUsage
     @Override
     public String getOperatorNumeric() {
         String imsi = getIMSI();
@@ -1510,6 +1519,7 @@ public class SIMRecords extends IccRecords {
         mRecordsToLoad++;
     }
 
+    @UnsupportedAppUsage
     protected void fetchSimRecords() {
         mRecordsRequested = true;
 
@@ -1615,81 +1625,10 @@ public class SIMRecords extends IccRecords {
         if (DBG) log("fetchSimRecords " + mRecordsToLoad + " requested: " + mRecordsRequested);
     }
 
-    /**
-     * Returns the SpnDisplayRule based on settings on the SIM and the
-     * current service state. See TS 22.101 Annex A and TS 51.011 10.3.11
-     * for details.
-     *
-     * If the SPN is not found on the SIM or is empty, the rule is
-     * always PLMN_ONLY.
-     *
-     * @param serviceState Service state
-     * @return the display rule
-     *
-     * @see #SPN_RULE_SHOW_SPN
-     * @see #SPN_RULE_SHOW_PLMN
-     */
     @Override
-    public int getDisplayRule(ServiceState serviceState) {
-        int rule;
-
-        if (mParentApp != null && mParentApp.getUiccProfile() != null
-                && mParentApp.getUiccProfile().getOperatorBrandOverride() != null) {
-        // If the operator has been overridden, treat it as the SPN file on the SIM did not exist.
-            rule = SPN_RULE_SHOW_PLMN;
-        } else if (TextUtils.isEmpty(getServiceProviderName()) || mSpnDisplayCondition == -1) {
-            // No EF_SPN content was found on the SIM, or not yet loaded.  Just show ONS.
-            rule = SPN_RULE_SHOW_PLMN;
-        } else if (useRoamingFromServiceState() ? !serviceState.getRoaming()
-                : isOnMatchingPlmn(serviceState.getOperatorNumeric())) {
-            rule = SPN_RULE_SHOW_SPN;
-            if ((mSpnDisplayCondition & 0x01) == 0x01) {
-                // ONS required when registered to HPLMN or PLMN in EF_SPDI
-                rule |= SPN_RULE_SHOW_PLMN;
-            }
-        } else {
-            rule = SPN_RULE_SHOW_PLMN;
-            if ((mSpnDisplayCondition & 0x02) == 0x00) {
-                // SPN required if not registered to HPLMN or PLMN in EF_SPDI
-                rule |= SPN_RULE_SHOW_SPN;
-            }
-        }
-        return rule;
-    }
-
-    private boolean useRoamingFromServiceState() {
-        CarrierConfigManager configManager = (CarrierConfigManager)
-                mContext.getSystemService(Context.CARRIER_CONFIG_SERVICE);
-        if (configManager != null) {
-            PersistableBundle b = configManager.getConfigForSubId(
-                    SubscriptionController.getInstance().getSubIdUsingPhoneId(
-                    mParentApp.getPhoneId()));
-            if (b != null && b.getBoolean(CarrierConfigManager
-                    .KEY_SPN_DISPLAY_RULE_USE_ROAMING_FROM_SERVICE_STATE_BOOL)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /**
-     * Checks if plmn is HPLMN or on the spdiNetworks list.
-     */
-    private boolean isOnMatchingPlmn(String plmn) {
-        if (plmn == null) return false;
-
-        if (plmn.equals(getOperatorNumeric())) {
-            return true;
-        }
-
-        if (mSpdiNetworks != null) {
-            for (String spdiNet : mSpdiNetworks) {
-                if (plmn.equals(spdiNet)) {
-                    return true;
-                }
-            }
-        }
-        return false;
+    @CarrierNameDisplayConditionBitmask
+    public int getCarrierNameDisplayCondition() {
+        return mCarrierNameDisplayCondition;
     }
 
     /**
@@ -1697,9 +1636,13 @@ public class SIMRecords extends IccRecords {
      */
     private enum GetSpnFsmState {
         IDLE,               // No initialized
+        @UnsupportedAppUsage
         INIT,               // Start FSM
+        @UnsupportedAppUsage
         READ_SPN_3GPP,      // Load EF_SPN firstly
+        @UnsupportedAppUsage
         READ_SPN_CPHS,      // Load EF_SPN_CPHS secondly
+        @UnsupportedAppUsage
         READ_SPN_SHORT_CPHS // Load EF_SPN_SHORT_CPHS last
     }
 
@@ -1720,6 +1663,7 @@ public class SIMRecords extends IccRecords {
      *        ar.exception holds exception in error
      *        ar.result is byte[] for data in success
      */
+    @UnsupportedAppUsage
     private void getSpnFsm(boolean start, AsyncResult ar) {
         byte[] data;
 
@@ -1752,7 +1696,11 @@ public class SIMRecords extends IccRecords {
             case READ_SPN_3GPP:
                 if (ar != null && ar.exception == null) {
                     data = (byte[]) ar.result;
-                    mSpnDisplayCondition = 0xff & data[0];
+
+                    // Reference: 3GPP TS 31.102 section 4.2.12 EF_SPN
+                    // The first byte is display condition.
+                    mCarrierNameDisplayCondition =
+                            convertSpnDisplayConditionToBitmask(data[0] & 0xff);
 
                     setServiceProviderName(IccUtils.adnStringFieldToString(
                                 data, 1, data.length - 1));
@@ -1764,7 +1712,7 @@ public class SIMRecords extends IccRecords {
                         mSpnState = GetSpnFsmState.READ_SPN_CPHS;
                     } else {
                         if (DBG) log("Load EF_SPN: " + spn
-                                + " spnDisplayCondition: " + mSpnDisplayCondition);
+                                + " carrierNameDisplayCondition: " + mCarrierNameDisplayCondition);
                         mTelephonyManager.setSimOperatorNameForPhone(
                                 mParentApp.getPhoneId(), spn);
 
@@ -1779,9 +1727,7 @@ public class SIMRecords extends IccRecords {
                             obtainMessage(EVENT_GET_SPN_DONE));
                     mRecordsToLoad++;
 
-                    // See TS 51.011 10.3.11.  Basically, default to
-                    // show PLMN always, and SPN also if roaming.
-                    mSpnDisplayCondition = -1;
+                    mCarrierNameDisplayCondition = DEFAULT_CARRIER_NAME_DISPLAY_CONDITION;
                 }
                 break;
             case READ_SPN_CPHS:
@@ -1798,7 +1744,7 @@ public class SIMRecords extends IccRecords {
                         mSpnState = GetSpnFsmState.READ_SPN_SHORT_CPHS;
                     } else {
                         // Display CPHS Operator Name only when not roaming
-                        mSpnDisplayCondition = 2;
+                        mCarrierNameDisplayCondition = 0;
 
                         if (DBG) log("Load EF_SPN_CPHS: " + spn);
                         mTelephonyManager.setSimOperatorNameForPhone(
@@ -1830,7 +1776,7 @@ public class SIMRecords extends IccRecords {
                         if (DBG) log("No SPN loaded in either CHPS or 3GPP");
                     } else {
                         // Display CPHS Operator Name only when not roaming
-                        mSpnDisplayCondition = 2;
+                        mCarrierNameDisplayCondition = 0;
 
                         if (DBG) log("Load EF_SPN_SHORT_CPHS: " + spn);
                         mTelephonyManager.setSimOperatorNameForPhone(
@@ -1853,8 +1799,7 @@ public class SIMRecords extends IccRecords {
      * This record contains the list of numeric network IDs that
      * are treated specially when determining SPN display
      */
-    private void
-    parseEfSpdi(byte[] data) {
+    private void parseEfSpdi(byte[] data) {
         SimTlv tlv = new SimTlv(data, 0, data.length);
 
         byte[] plmnEntries = null;
@@ -1875,18 +1820,15 @@ public class SIMRecords extends IccRecords {
             return;
         }
 
-        mSpdiNetworks = new ArrayList<String>(plmnEntries.length / 3);
-
-        for (int i = 0 ; i + 2 < plmnEntries.length ; i += 3) {
-            String plmnCode;
-            plmnCode = IccUtils.bcdPlmnToString(plmnEntries, i);
-
-            // Valid operator codes are 5 or 6 digits
-            if (plmnCode != null && plmnCode.length() >= 5) {
-                log("EF_SPDI network: " + plmnCode);
-                mSpdiNetworks.add(plmnCode);
+        List<String> tmpSpdi = new ArrayList<>(plmnEntries.length / 3);
+        for (int i = 0; i + 2 < plmnEntries.length; i += 3) {
+            String plmnCode = IccUtils.bcdPlmnToString(plmnEntries, i);
+            if (!TextUtils.isEmpty(plmnCode)) {
+                log("EF_SPDI PLMN: " + plmnCode);
+                tmpSpdi.add(plmnCode);
             }
         }
+        mSpdi = (String[]) tmpSpdi.toArray();
     }
 
     /**
@@ -1915,16 +1857,19 @@ public class SIMRecords extends IccRecords {
     /**
      * check to see if Mailbox Number is allocated and activated in CPHS SST
      */
+    @UnsupportedAppUsage
     private boolean isCphsMailboxEnabled() {
         if (mCphsInfo == null)  return false;
         return ((mCphsInfo[1] & CPHS_SST_MBN_MASK) == CPHS_SST_MBN_ENABLED );
     }
 
+    @UnsupportedAppUsage
     @Override
     protected void log(String s) {
         Rlog.d(LOG_TAG, "[SIMRecords] " + s);
     }
 
+    @UnsupportedAppUsage
     @Override
     protected void loge(String s) {
         Rlog.e(LOG_TAG, "[SIMRecords] " + s);
@@ -1934,6 +1879,7 @@ public class SIMRecords extends IccRecords {
         Rlog.w(LOG_TAG, "[SIMRecords] " + s, tr);
     }
 
+    @UnsupportedAppUsage
     protected void logv(String s) {
         Rlog.v(LOG_TAG, "[SIMRecords] " + s);
     }
@@ -2002,8 +1948,8 @@ public class SIMRecords extends IccRecords {
         pw.println(" mEfCPHS_MWI[]=" + Arrays.toString(mEfCPHS_MWI));
         pw.println(" mEfCff[]=" + Arrays.toString(mEfCff));
         pw.println(" mEfCfis[]=" + Arrays.toString(mEfCfis));
-        pw.println(" mSpnDisplayCondition=" + mSpnDisplayCondition);
-        pw.println(" mSpdiNetworks[]=" + mSpdiNetworks);
+        pw.println(" mCarrierNameDisplayCondition=" + mCarrierNameDisplayCondition);
+        pw.println(" mSpdi[]=" + mSpdi);
         pw.println(" mUsimServiceTable=" + mUsimServiceTable);
         pw.println(" mGid1=" + mGid1);
         if (mCarrierTestOverride.isInTestMode()) {

@@ -24,6 +24,7 @@ import android.net.Uri;
 import android.os.BadParcelableException;
 import android.os.Build;
 import android.os.Bundle;
+import android.telephony.AccessNetworkConstants;
 import android.telephony.Rlog;
 import android.telephony.ServiceState;
 import android.telephony.ims.ImsCallProfile;
@@ -148,10 +149,12 @@ public class TelephonyTester {
                 if (DBG) log("sIntentReceiver.onReceive: action=" + action);
                 if (action.equals(mPhone.getActionDetached())) {
                     log("simulate detaching");
-                    mPhone.getServiceStateTracker().mDetachedRegistrants.notifyRegistrants();
+                    mPhone.getServiceStateTracker().mDetachedRegistrants.get(
+                            AccessNetworkConstants.TRANSPORT_TYPE_WWAN).notifyRegistrants();
                 } else if (action.equals(mPhone.getActionAttached())) {
                     log("simulate attaching");
-                    mPhone.getServiceStateTracker().mAttachedRegistrants.notifyRegistrants();
+                    mPhone.getServiceStateTracker().mAttachedRegistrants.get(
+                            AccessNetworkConstants.TRANSPORT_TYPE_WWAN).notifyRegistrants();
                 } else if (action.equals(ACTION_TEST_CONFERENCE_EVENT_PACKAGE)) {
                     log("inject simulated conference event package");
                     handleTestConferenceEventPackage(context,
@@ -360,7 +363,10 @@ public class TelephonyTester {
             log("Service state override reset");
             return;
         }
-        if (mServiceStateTestIntent.hasExtra(EXTRA_VOICE_REG_STATE)) {
+
+        // TODO: Fix this with modifing NetworkRegistrationInfo inside ServiceState. Do not call
+        // ServiceState's set methods directly.
+        /*if (mServiceStateTestIntent.hasExtra(EXTRA_VOICE_REG_STATE)) {
             ss.setVoiceRegState(mServiceStateTestIntent.getIntExtra(EXTRA_VOICE_REG_STATE,
                     ServiceState.STATE_OUT_OF_SERVICE));
             log("Override voice service state with " + ss.getVoiceRegState());
@@ -379,7 +385,7 @@ public class TelephonyTester {
             ss.setRilDataRadioTechnology(mServiceStateTestIntent.getIntExtra(EXTRA_DATA_RAT,
                     ServiceState.RIL_RADIO_TECHNOLOGY_UNKNOWN));
             log("Override data rat with " + ss.getRilDataRadioTechnology());
-        }
+        }*/
         if (mServiceStateTestIntent.hasExtra(EXTRA_VOICE_ROAMING_TYPE)) {
             ss.setVoiceRoamingType(mServiceStateTestIntent.getIntExtra(EXTRA_VOICE_ROAMING_TYPE,
                     ServiceState.ROAMING_TYPE_UNKNOWN));
