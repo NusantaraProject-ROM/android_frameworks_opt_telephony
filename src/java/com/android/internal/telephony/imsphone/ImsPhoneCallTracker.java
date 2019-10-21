@@ -515,6 +515,11 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
      */
     private Map<Pair<Integer, String>, Integer> mImsReasonCodeMap = new ArrayMap<>();
 
+     /**
+     * Carrier configuration option which indicates whether the carrier supports the hold
+     * command while in an IMS call
+     */
+    private boolean mAllowHoldingCall = true;
 
     /**
      * TODO: Remove this code; it is a workaround.
@@ -978,6 +983,23 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
     }
 
     /**
+     * Determines if the device will respect the value of the
+     * {@link CarrierConfigManager#KEY_ALLOW_HOLD_IN_IMS_CALL_BOOL} configuration option.
+     *
+     * @return {@code false} if the device always supports holding IMS calls, {@code true} if it
+     *      will use {@link CarrierConfigManager#KEY_ALLOW_HOLD_IN_IMS_CALL_BOOL} to determine if
+     *      hold is supported.
+     */
+    private boolean doesDeviceRespectHoldCarrierConfig() {
+        Phone phone = getPhone();
+        if (phone == null) {
+            return true;
+        }
+        return phone.getContext().getResources().getBoolean(
+                com.android.internal.R.bool.config_device_respects_hold_carrier_config);
+    }
+
+    /**
      * Caches frequently used carrier configuration items locally.
      *
      * @param subId The sub id.
@@ -1045,6 +1067,8 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
                 CarrierConfigManager.KEY_AUTO_RETRY_FAILED_WIFI_EMERGENCY_CALL);
         mIgnoreResetUtCapability =  carrierConfig.getBoolean(
                 CarrierConfigManager.KEY_IGNORE_RESET_UT_CAPABILITY_BOOL);
+        mAllowHoldingCall = carrierConfig.getBoolean(
+                CarrierConfigManager.KEY_ALLOW_HOLD_IN_IMS_CALL_BOOL);
 
         String[] mappings = carrierConfig
                 .getStringArray(CarrierConfigManager.KEY_IMS_REASONINFO_MAPPING_STRING_ARRAY);
@@ -1142,6 +1166,8 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
                 setEmergencyCallInfo(profile, conn);
             }
 
+            boolean isStartRttCall = true;
+
             // Translate call subject intent-extra from Telecom-specific extra key to the
             // ImsCallProfile key.
             if (intentExtras != null) {
@@ -1152,7 +1178,10 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
                     );
                 }
 
-                if (conn.hasRttTextStream()) {
+                isStartRttCall = intentExtras.getBoolean(
+                    android.telecom.TelecomManager.EXTRA_START_CALL_WITH_RTT, true);
+                if (DBG) log("dialInternal: isStartRttCall = " + isStartRttCall);
+                if (conn.hasRttTextStream() && isStartRttCall) {
                     profile.mMediaProfile.mRttMode = ImsStreamMediaProfile.RTT_MODE_FULL;
                 }
 
@@ -1174,17 +1203,10 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
                 // being sent to the lower layers/to the network.
             }
 
-            int mode = QtiImsUtils.getRttOperatingMode(mPhone.getContext());
+            int mode = QtiImsUtils.getRttOperatingMode(mPhone.getContext(), mPhone.getPhoneId());
             if (DBG) log("RTT: setRttModeBasedOnOperator mode = " + mode);
 
             if (mPhone.isRttSupported() && mPhone.isRttOn()) {
-                boolean isStartRttCall = true;
-                if (intentExtras != null) {
-                    isStartRttCall = intentExtras.getBoolean(
-                            android.telecom.TelecomManager.EXTRA_START_CALL_WITH_RTT, true);
-
-                }
-                if (DBG) log("dialInternal: isStartRttCall = " + isStartRttCall);
                 if (isStartRttCall &&
                         (!profile.isVideoCall() || QtiImsUtils.isRttSupportedOnVtCalls(
                         mPhone.getPhoneId(),mPhone.getContext()))) {
@@ -1326,6 +1348,7 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
                     ImsCommand.IMS_CMD_HOLD);
         } catch (ImsException e) {
             mForegroundCall.switchWith(mBackgroundCall);
+            mHoldSwitchingState = HoldSwapState.INACTIVE;
             throw new CallStateException(e.getMessage());
         }
     }
@@ -1355,6 +1378,7 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
                         ImsCommand.IMS_CMD_HOLD);
             } catch (ImsException e) {
                 mForegroundCall.switchWith(mBackgroundCall);
+                mHoldSwitchingState = HoldSwapState.INACTIVE;
                 throw new CallStateException(e.getMessage());
             }
         }
@@ -1377,6 +1401,7 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
                         ImsCommand.IMS_CMD_HOLD);
             } catch (ImsException e) {
                 mForegroundCall.switchWith(mBackgroundCall);
+                mHoldSwitchingState = HoldSwapState.INACTIVE;
                 throw new CallStateException(e.getMessage());
             }
         }
@@ -1403,6 +1428,8 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
                         ImsCommand.IMS_CMD_RESUME);
             }
         } catch (ImsException e) {
+            mForegroundCall.switchWith(mBackgroundCall);
+            mHoldSwitchingState = HoldSwapState.INACTIVE;
             throw new CallStateException(e.getMessage());
         }
     }
@@ -2641,6 +2668,17 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
                         dialPendingMO();
                         mHoldSwitchingState = HoldSwapState.INACTIVE;
                         logHoldSwapState("onCallHeld hold to dial");
+                    }  else if (mHoldSwitchingState == HoldSwapState.PENDING_SINGLE_CALL_HOLD
+                            && doesDeviceRespectHoldCarrierConfig() && !mAllowHoldingCall) {
+                        // In this case since holding/unholding call is not allowed from UI we are
+                        // resuming the call which is currently in background.
+                        // The current fix assumes that holdActiveCall() which also sets
+                        // mHoldSwitchingState to HoldSwapState.PENDING_SINGLE_CALL_HOLD
+                        // will only be called from UI and not from framework.
+                        mForegroundCall.switchWith(mBackgroundCall);
+                        sendEmptyMessage(EVENT_RESUME_NOW_FOREGROUND_CALL);
+                        mHoldSwitchingState = HoldSwapState.INACTIVE;
+                        logHoldSwapState("onCallHeld auto resume");
                     } else {
                         // In this case there will be no call resumed, so we can assume that we
                         // are done switching fg and bg calls now.
