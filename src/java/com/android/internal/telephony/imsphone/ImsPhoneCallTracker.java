@@ -1181,7 +1181,10 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
                 isStartRttCall = intentExtras.getBoolean(
                     android.telecom.TelecomManager.EXTRA_START_CALL_WITH_RTT, true);
                 if (DBG) log("dialInternal: isStartRttCall = " + isStartRttCall);
-                if (conn.hasRttTextStream() && isStartRttCall) {
+
+                // Set the RTT mode to 1 if sim supports RTT and if the connection has
+                // valid RTT text stream
+                if (mPhone.isRttSupported() && conn.hasRttTextStream() && isStartRttCall) {
                     profile.mMediaProfile.mRttMode = ImsStreamMediaProfile.RTT_MODE_FULL;
                 }
 
@@ -1206,6 +1209,7 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
             int mode = QtiImsUtils.getRttOperatingMode(mPhone.getContext(), mPhone.getPhoneId());
             if (DBG) log("RTT: setRttModeBasedOnOperator mode = " + mode);
 
+            // Override RTT mode as per operator requirements not supported by AOSP
             if (mPhone.isRttSupported() && mPhone.isRttOn()) {
                 if (isStartRttCall &&
                         (!profile.isVideoCall() || QtiImsUtils.isRttSupportedOnVtCalls(
@@ -1392,6 +1396,7 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
                 && mRingingCall.getState() == ImsPhoneCall.State.WAITING;
         if (switchingWithWaitingCall) {
             ImsCall callToHold = mForegroundCall.getImsCall();
+            mCallExpectedToResume = mRingingCall.getImsCall();
             mHoldSwitchingState = HoldSwapState.HOLDING_TO_ANSWER_INCOMING;
             mForegroundCall.switchWith(mBackgroundCall);
             logHoldSwapState("holdActiveCallForWaitingCall");
@@ -2063,6 +2068,19 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
             //detach the disconnected connections
             conn.getCall().detach(conn);
             removeConnection(conn);
+
+            // remove conference participants from the cached list when call is disconnected
+            List<ConferenceParticipant> cpList = imsCall.getConferenceParticipants();
+            if (cpList != null) {
+                for (ConferenceParticipant cp : cpList) {
+                    String number = ConferenceParticipant.getParticipantAddress(cp.getHandle(),
+                            getCountryIso()).getSchemeSpecificPart();
+                    if (!TextUtils.isEmpty(number)) {
+                        String formattedNumber = getFormattedPhoneNumber(number);
+                        mPhoneNumAndConnTime.remove(formattedNumber);
+                    }
+                }
+            }
         }
 
         if (changed) {
@@ -2094,6 +2112,9 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
      */
     @VisibleForTesting
     public void addReasonCodeRemapping(Integer fromCode, String message, Integer toCode) {
+        if (message != null) {
+            message = message.toLowerCase();
+        }
         mImsReasonCodeMap.put(new Pair<>(fromCode, message), toCode);
     }
 
@@ -2112,6 +2133,8 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
         String reason = reasonInfo.getExtraMessage();
         if (reason == null) {
             reason = "";
+        } else {
+            reason = reason.toLowerCase();
         }
         log("maybeRemapReasonCode : fromCode = " + reasonInfo.getCode() + " ; message = "
                 + reason);
@@ -2193,6 +2216,12 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
             case ImsReasonInfo.CODE_SIP_NOT_ACCEPTABLE:
             case ImsReasonInfo.CODE_SIP_GLOBAL_ERROR:
                 return DisconnectCause.SERVER_ERROR;
+
+            case ImsReasonInfo.CODE_EMERGENCY_CALL_OVER_WFC_NOT_AVAILABLE:
+                return DisconnectCause.EMERGENCY_CALL_OVER_WFC_NOT_AVAILABLE;
+
+            case ImsReasonInfo.CODE_WFC_SERVICE_NOT_AVAILABLE_IN_THIS_LOCATION:
+                return DisconnectCause.WFC_SERVICE_NOT_AVAILABLE_IN_THIS_LOCATION;
 
             case ImsReasonInfo.CODE_SIP_SERVICE_UNAVAILABLE:
             case ImsReasonInfo.CODE_SIP_SERVER_ERROR:
@@ -2603,12 +2632,20 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
                 // Check to see which call got terminated. If it's the one that was gonna get held,
                 // ignore it. If it's the one that was gonna get answered, restore the one that
                 // possibly got held.
-                if (imsCall == mCallExpectedToResume) {
+                // If holding the active call is still in progress when the waiting call terminates
+                // resume the held call in onCallHeld. Else resume the call here.
+                if ((imsCall == mCallExpectedToResume) &&
+                            mBackgroundCall.getState() == ImsPhoneCall.State.HOLDING) {
                     mForegroundCall.switchWith(mBackgroundCall);
                     mCallExpectedToResume = null;
                     mHoldSwitchingState = HoldSwapState.INACTIVE;
                     logHoldSwapState("onCallTerminated hold to answer case");
                     sendEmptyMessage(EVENT_RESUME_NOW_FOREGROUND_CALL);
+                } else if (mRingingCall.getState() == ImsPhoneCall.State.WAITING) {
+                    //In case of the call to be HELD being terminated answer the ringing call
+                    //before ACTIVE call session gets closed as there will be no onCallHoldFailed
+                    //callback triggered to answer waiting call
+                    sendEmptyMessage(EVENT_ANSWER_WAITING_CALL);
                 }
             } else if (mHoldSwitchingState == HoldSwapState.HOLDING_TO_DIAL_OUTGOING ||
                     mHoldSwitchingState == HoldSwapState.ENDING_TO_DIAL_OUTGOING) {
@@ -2679,6 +2716,16 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
                         sendEmptyMessage(EVENT_RESUME_NOW_FOREGROUND_CALL);
                         mHoldSwitchingState = HoldSwapState.INACTIVE;
                         logHoldSwapState("onCallHeld auto resume");
+                    } else if (mRingingCall.getState() == ImsPhoneCall.State.IDLE
+                              && mHoldSwitchingState == HoldSwapState.HOLDING_TO_ANSWER_INCOMING) {
+                        //Handle the case where waiting call gets terminated while HOLDING of ACTIVE
+                        //call is still in progress and the held call is not resumed in
+                        //onCallTerminated.
+                        mForegroundCall.switchWith(mBackgroundCall);
+                        sendEmptyMessage(EVENT_RESUME_NOW_FOREGROUND_CALL);
+                        mHoldSwitchingState = HoldSwapState.INACTIVE;
+                        mCallExpectedToResume = null;
+                        logHoldSwapState("onCallHeld premature termination of waiting call");
                     } else {
                         // In this case there will be no call resumed, so we can assume that we
                         // are done switching fg and bg calls now.
@@ -3631,6 +3678,16 @@ public class ImsPhoneCallTracker extends CallTracker implements ImsPullCall {
                 try {
                     mLastDialArgs.intentExtras.putBoolean(
                             android.telecom.TelecomManager.EXTRA_START_CALL_WITH_RTT, false);
+
+                    mLastDialArgs.intentExtras.putInt(
+                            QtiImsUtils.EXTRA_RETRY_CALL_FAIL_REASON,
+                            QtiImsUtils.CODE_RETRY_ON_IMS_WITHOUT_RTT);
+
+                    int callRadioTech = oldConnection.getCallRadioTech();
+                    log("old callRadioTech = " + callRadioTech);
+                    mLastDialArgs.intentExtras.putInt(
+                            QtiImsUtils.EXTRA_RETRY_CALL_FAIL_RADIOTECH, callRadioTech);
+
                     mLastDialArgs = ImsPhone.ImsDialArgs.Builder.from(mLastDialArgs)
                                             .setRttTextStream(null).build();
                     Connection newConnection =
