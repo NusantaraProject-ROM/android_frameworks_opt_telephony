@@ -876,6 +876,7 @@ public class SIMRecords extends IccRecords {
 
                 case EVENT_GET_SPN_DONE:
                     isRecordLoadResponse = true;
+                    mEssentialRecordsToLoad -= 1;
                     ar = (AsyncResult) msg.obj;
                     getSpnFsm(false, ar);
                     break;
@@ -1515,6 +1516,7 @@ public class SIMRecords extends IccRecords {
 
         mFh.loadEFTransparent(EF_ICCID, obtainMessage(EVENT_GET_ICCID_DONE));
         mRecordsToLoad++;
+        mEssentialRecordsToLoad++;
     }
 
     private void loadEfLiAndEfPl() {
@@ -1538,7 +1540,9 @@ public class SIMRecords extends IccRecords {
     }
 
     private void fetchEssentialSimRecords() {
-        if (DBG) log("fetchEssentialSimRecords " + mRecordsToLoad);
+        if (DBG) log("fetchEssentialSimRecords: mRecordsToLoad = " + mRecordsToLoad
+                + " mEssentialRecordsToLoad = " + mEssentialRecordsToLoad);
+        mEssentialRecordsListenerNotified = false;
 
         mCi.getIMSIForApp(mParentApp.getAid(), obtainMessage(EVENT_GET_IMSI_DONE));
         mRecordsToLoad++;
@@ -1567,6 +1571,7 @@ public class SIMRecords extends IccRecords {
         mRecordsToLoad++;
         mEssentialRecordsToLoad++;
 
+        getSpnFsm(true, null);
         if (DBG) log("fetchEssentialSimRecords " + mRecordsToLoad +
                 " requested: " + mRecordsRequested);
     }
@@ -1600,8 +1605,6 @@ public class SIMRecords extends IccRecords {
         // Same goes for Call Forward Status indicator: fetch both
         // EF[CFIS] and CPHS-EF, with EF[CFIS] preferred.
         loadCallForwardingRecords();
-
-        getSpnFsm(true, null);
 
         mFh.loadEFTransparent(EF_SPDI, obtainMessage(EVENT_GET_SPDI_DONE));
         mRecordsToLoad++;
@@ -1724,6 +1727,7 @@ public class SIMRecords extends IccRecords {
                 mFh.loadEFTransparent(EF_SPN,
                         obtainMessage(EVENT_GET_SPN_DONE));
                 mRecordsToLoad++;
+                mEssentialRecordsToLoad++;
 
                 mSpnState = GetSpnFsmState.READ_SPN_3GPP;
                 break;
@@ -1760,6 +1764,7 @@ public class SIMRecords extends IccRecords {
                     mFh.loadEFTransparent( EF_SPN_CPHS,
                             obtainMessage(EVENT_GET_SPN_DONE));
                     mRecordsToLoad++;
+                    mEssentialRecordsToLoad++;
 
                     mCarrierNameDisplayCondition = DEFAULT_CARRIER_NAME_DISPLAY_CONDITION;
                 }
@@ -1794,6 +1799,7 @@ public class SIMRecords extends IccRecords {
                     mFh.loadEFTransparent(
                             EF_SPN_SHORT_CPHS, obtainMessage(EVENT_GET_SPN_DONE));
                     mRecordsToLoad++;
+                    mEssentialRecordsToLoad++;
                 }
                 break;
             case READ_SPN_SHORT_CPHS:
