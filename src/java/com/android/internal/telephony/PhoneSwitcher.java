@@ -80,9 +80,8 @@ import java.util.concurrent.CompletableFuture;
  * the active phones.  Note we don't wait for data attach (which may not happen anyway).
  */
 public class PhoneSwitcher extends Handler {
-    private static final String LOG_TAG = "PhoneSwitcher";
-    private static final boolean VDBG = false;
-
+    protected final static String LOG_TAG = "PhoneSwitcher";
+    protected final static boolean VDBG = false;
     private static final int DEFAULT_NETWORK_CHANGE_TIMEOUT_MS = 5000;
     private static final int MODEM_COMMAND_RETRY_PERIOD_MS     = 5000;
     // After the emergency call ends, wait for a few seconds to see if we enter ECBM before starting
@@ -151,33 +150,33 @@ public class PhoneSwitcher extends Handler {
         }
     }
 
-    private final List<DcRequest> mPrioritizedDcRequests = new ArrayList<DcRequest>();
-    private final RegistrantList mActivePhoneRegistrants;
-    private final SubscriptionController mSubscriptionController;
-    private final int[] mPhoneSubscriptions;
-    private final CommandsInterface[] mCommandsInterfaces;
-    private final Context mContext;
-    private final PhoneState[] mPhoneStates;
+    protected final List<DcRequest> mPrioritizedDcRequests = new ArrayList<DcRequest>();
+    protected final RegistrantList mActivePhoneRegistrants;
+    protected final SubscriptionController mSubscriptionController;
+    protected final int[] mPhoneSubscriptions;
+    protected final CommandsInterface[] mCommandsInterfaces;
+    protected final Context mContext;
+    protected final PhoneState[] mPhoneStates;
     @UnsupportedAppUsage
-    private final int mNumPhones;
+    protected final int mNumPhones;
     @UnsupportedAppUsage
-    private final Phone[] mPhones;
+    protected final Phone[] mPhones;
     private final LocalLog mLocalLog;
     @VisibleForTesting
     public final PhoneStateListener mPhoneStateListener;
-    private final CellularNetworkValidator mValidator;
+    protected final CellularNetworkValidator mValidator;
     @VisibleForTesting
     public final CellularNetworkValidator.ValidationCallback mValidationCallback =
             (validated, subId) -> Message.obtain(PhoneSwitcher.this,
                     EVENT_NETWORK_VALIDATION_DONE, subId, validated ? 1 : 0).sendToTarget();
     @UnsupportedAppUsage
-    private int mMaxActivePhones;
-    private static PhoneSwitcher sPhoneSwitcher = null;
+    protected int mMaxActivePhones;
+    protected static PhoneSwitcher sPhoneSwitcher = null;
 
     // Which primary (non-opportunistic) subscription is set as data subscription among all primary
     // subscriptions. This value usually comes from user setting, and it's the subscription used for
     // Internet data if mOpptDataSubId is not set.
-    private int mPrimaryDataSubId = SubscriptionManager.INVALID_SUBSCRIPTION_ID;
+    protected int mPrimaryDataSubId = SubscriptionManager.INVALID_SUBSCRIPTION_ID;
 
     // mOpptDataSubId must be an active subscription. If it's set, it overrides mPrimaryDataSubId
     // to be used for Internet data.
@@ -185,7 +184,7 @@ public class PhoneSwitcher extends Handler {
 
     // The phone ID that has an active voice call. If set, and its mobile data setting is on,
     // it will become the mPreferredDataPhoneId.
-    private int mPhoneIdInVoiceCall = SubscriptionManager.INVALID_PHONE_INDEX;
+    protected int mPhoneIdInVoiceCall = SubscriptionManager.INVALID_PHONE_INDEX;
 
     @VisibleForTesting
     // It decides:
@@ -197,7 +196,7 @@ public class PhoneSwitcher extends Handler {
     protected int mPreferredDataPhoneId = SubscriptionManager.INVALID_PHONE_INDEX;
 
     // Subscription ID corresponds to mPreferredDataPhoneId.
-    private int mPreferredDataSubId = SubscriptionManager.INVALID_SUBSCRIPTION_ID;
+    protected int mPreferredDataSubId = SubscriptionManager.INVALID_SUBSCRIPTION_ID;
 
     // If non-null, An emergency call is about to be started, is ongoing, or has just ended and we
     // are overriding the DDS.
@@ -206,8 +205,8 @@ public class PhoneSwitcher extends Handler {
 
     private ISetOpportunisticDataCallback mSetOpptSubCallback;
 
-    private static final int EVENT_PRIMARY_DATA_SUB_CHANGED       = 101;
-    private static final int EVENT_SUBSCRIPTION_CHANGED           = 102;
+    protected static final int EVENT_PRIMARY_DATA_SUB_CHANGED       = 101;
+    protected static final int EVENT_SUBSCRIPTION_CHANGED           = 102;
     private static final int EVENT_REQUEST_NETWORK                = 103;
     private static final int EVENT_RELEASE_NETWORK                = 104;
     // ECBM has started/ended. If we just ended an emergency call and mEmergencyOverride is not
@@ -217,7 +216,7 @@ public class PhoneSwitcher extends Handler {
     private static final int EVENT_EMERGENCY_TOGGLE               = 105;
     private static final int EVENT_RADIO_CAPABILITY_CHANGED       = 106;
     private static final int EVENT_OPPT_DATA_SUB_CHANGED          = 107;
-    private static final int EVENT_RADIO_AVAILABLE                = 108;
+    protected static final int EVENT_RADIO_AVAILABLE                = 108;
     // A call has either started or ended. If an emergency ended and DDS is overridden using
     // mEmergencyOverride, start the countdown to remove the override using the message
     // EVENT_REMOVE_DDS_EMERGENCY_OVERRIDE. The only exception to this is if the device moves to
@@ -237,16 +236,19 @@ public class PhoneSwitcher extends Handler {
     private static final int EVENT_OVERRIDE_DDS_FOR_EMERGENCY     = 115;
     // If it exists, remove the current mEmergencyOverride DDS override.
     private static final int EVENT_REMOVE_DDS_EMERGENCY_OVERRIDE  = 116;
+    protected final static int EVENT_VOICE_CALL_ENDED             = 117;
+    protected static final int EVENT_UNSOL_MAX_DATA_ALLOWED_CHANGED = 118;
+    protected static final int EVENT_OEM_HOOK_SERVICE_READY       = 119;
 
     // Depending on version of IRadioConfig, we need to send either RIL_REQUEST_ALLOW_DATA if it's
     // 1.0, or RIL_REQUEST_SET_PREFERRED_DATA if it's 1.1 or later. So internally mHalCommandToUse
     // will be either HAL_COMMAND_ALLOW_DATA or HAL_COMMAND_ALLOW_DATA or HAL_COMMAND_UNKNOWN.
-    private static final int HAL_COMMAND_UNKNOWN        = 0;
-    private static final int HAL_COMMAND_ALLOW_DATA     = 1;
-    private static final int HAL_COMMAND_PREFERRED_DATA = 2;
-    private int mHalCommandToUse = HAL_COMMAND_UNKNOWN;
+    protected static final int HAL_COMMAND_UNKNOWN        = 0;
+    protected static final int HAL_COMMAND_ALLOW_DATA     = 1;
+    protected static final int HAL_COMMAND_PREFERRED_DATA = 2;
+    protected int mHalCommandToUse = HAL_COMMAND_UNKNOWN;
 
-    private RadioConfig mRadioConfig;
+    protected RadioConfig mRadioConfig;
 
     private final static int MAX_LOCAL_LOG_LINES = 30;
 
@@ -661,6 +663,12 @@ public class PhoneSwitcher extends Handler {
 
     private void onRequestNetwork(NetworkRequest networkRequest) {
         final DcRequest dcRequest = new DcRequest(networkRequest, mContext);
+        if (networkRequest.type != NetworkRequest.Type.REQUEST &&
+                networkRequest.type != NetworkRequest.Type.BACKGROUND_REQUEST) {
+           log("Skip non REQUEST/BACKGROUND_REQUEST type request: " + networkRequest);
+           return;
+        }
+
         if (!mPrioritizedDcRequests.contains(dcRequest)) {
             collectRequestNetworkMetrics(networkRequest);
             mPrioritizedDcRequests.add(dcRequest);
@@ -672,7 +680,8 @@ public class PhoneSwitcher extends Handler {
     private void onReleaseNetwork(NetworkRequest networkRequest) {
         final DcRequest dcRequest = new DcRequest(networkRequest, mContext);
 
-        if (mPrioritizedDcRequests.remove(dcRequest)) {
+        if (mPrioritizedDcRequests.contains(dcRequest) &&
+                mPrioritizedDcRequests.remove(dcRequest)) {
             onEvaluate(REQUESTS_CHANGED, "netReleased");
             collectReleaseNetworkMetrics(networkRequest);
         }
@@ -720,7 +729,7 @@ public class PhoneSwitcher extends Handler {
     }
 
     private static final boolean REQUESTS_CHANGED   = true;
-    private static final boolean REQUESTS_UNCHANGED = false;
+    protected static final boolean REQUESTS_UNCHANGED = false;
     /**
      * Re-evaluate things. Do nothing if nothing's changed.
      *
@@ -730,7 +739,7 @@ public class PhoneSwitcher extends Handler {
      *
      * @return {@code True} if the default data subscription need to be changed.
      */
-    private boolean onEvaluate(boolean requestsChanged, String reason) {
+    protected boolean onEvaluate(boolean requestsChanged, String reason) {
         StringBuilder sb = new StringBuilder(reason);
 
         // If we use HAL_COMMAND_PREFERRED_DATA,
@@ -858,18 +867,18 @@ public class PhoneSwitcher extends Handler {
         return diffDetected;
     }
 
-    private static class PhoneState {
+    protected static class PhoneState {
         public volatile boolean active = false;
         public long lastRequested = 0;
     }
 
     @UnsupportedAppUsage
-    private void activate(int phoneId) {
+    protected void activate(int phoneId) {
         switchPhone(phoneId, true);
     }
 
     @UnsupportedAppUsage
-    private void deactivate(int phoneId) {
+    protected void deactivate(int phoneId) {
         switchPhone(phoneId, false);
     }
 
@@ -922,7 +931,7 @@ public class PhoneSwitcher extends Handler {
         msg.sendToTarget();
     }
 
-    private void sendRilCommands(int phoneId) {
+    protected void sendRilCommands(int phoneId) {
         if (!SubscriptionManager.isValidPhoneId(phoneId) || phoneId >= mNumPhones) return;
 
         Message message = Message.obtain(this, EVENT_MODEM_COMMAND_DONE, phoneId);
@@ -947,7 +956,7 @@ public class PhoneSwitcher extends Handler {
         }
     }
 
-    private int phoneIdForRequest(NetworkRequest netRequest) {
+    protected int phoneIdForRequest(NetworkRequest netRequest) {
         int subId = getSubIdFromNetworkSpecifier(netRequest.networkCapabilities
                 .getNetworkSpecifier());
 
@@ -981,7 +990,7 @@ public class PhoneSwitcher extends Handler {
         return phoneId;
     }
 
-    private int getSubIdFromNetworkSpecifier(NetworkSpecifier specifier) {
+    protected int getSubIdFromNetworkSpecifier(NetworkSpecifier specifier) {
         if (specifier == null) {
             return DEFAULT_SUBSCRIPTION_ID;
         }
@@ -1013,7 +1022,7 @@ public class PhoneSwitcher extends Handler {
 
     // This updates mPreferredDataPhoneId which decides which phone should handle default network
     // requests.
-    private void updatePreferredDataPhoneId() {
+    protected void updatePreferredDataPhoneId() {
         Phone voicePhone = findPhoneById(mPhoneIdInVoiceCall);
         if (mEmergencyOverride != null && findPhoneById(mEmergencyOverride.mPhoneId) != null) {
             // Override DDS for emergency even if user data is not enabled, since it is an
@@ -1049,7 +1058,7 @@ public class PhoneSwitcher extends Handler {
         mPreferredDataSubId = mSubscriptionController.getSubIdUsingPhoneId(mPreferredDataPhoneId);
     }
 
-    private void transitionToEmergencyPhone() {
+    protected void transitionToEmergencyPhone() {
         if (mPreferredDataPhoneId != DEFAULT_EMERGENCY_PHONE_ID) {
             log("No active subscriptions: resetting preferred phone to 0 for emergency");
             mPreferredDataPhoneId = DEFAULT_EMERGENCY_PHONE_ID;
@@ -1249,7 +1258,7 @@ public class PhoneSwitcher extends Handler {
                 subId, needValidation ? 1 : 0, callback).sendToTarget();
     }
 
-    private boolean isPhoneInVoiceCall(Phone phone) {
+    protected boolean isPhoneInVoiceCall(Phone phone) {
         if (phone == null) {
             return false;
         }
@@ -1279,7 +1288,7 @@ public class PhoneSwitcher extends Handler {
     }
 
     @UnsupportedAppUsage
-    private void log(String l) {
+    protected void log(String l) {
         Rlog.d(LOG_TAG, l);
         mLocalLog.log(l);
     }
@@ -1295,7 +1304,7 @@ public class PhoneSwitcher extends Handler {
     /**
      * See {@link PhoneStateListener#LISTEN_ACTIVE_DATA_SUBSCRIPTION_ID_CHANGE}.
      */
-    private void notifyPreferredDataSubIdChanged() {
+    protected void notifyPreferredDataSubIdChanged() {
         ITelephonyRegistry tr = ITelephonyRegistry.Stub.asInterface(ServiceManager.getService(
                 "telephony.registry"));
         try {

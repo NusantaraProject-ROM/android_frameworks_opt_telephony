@@ -92,6 +92,7 @@ public abstract class IccRecords extends Handler implements IccConstants {
     protected TelephonyManager mTelephonyManager;
 
     protected RegistrantList mRecordsLoadedRegistrants = new RegistrantList();
+    protected RegistrantList mEssentialRecordsLoadedRegistrants = new RegistrantList();
     protected RegistrantList mLockedRecordsLoadedRegistrants = new RegistrantList();
     protected RegistrantList mNetworkLockedRecordsLoadedRegistrants = new RegistrantList();
     protected RegistrantList mImsiReadyRegistrants = new RegistrantList();
@@ -101,6 +102,12 @@ public abstract class IccRecords extends Handler implements IccConstants {
     protected RegistrantList mNetworkSelectionModeAutomaticRegistrants = new RegistrantList();
     protected RegistrantList mSpnUpdatedRegistrants = new RegistrantList();
     protected RegistrantList mRecordsOverrideRegistrants = new RegistrantList();
+
+    @UnsupportedAppUsage
+    protected boolean mEssentialRecordsListenerNotified;
+
+    @UnsupportedAppUsage
+    protected int mEssentialRecordsToLoad;  // number of pending essential records load requests
 
     @UnsupportedAppUsage
     protected int mRecordsToLoad;  // number of pending load requests
@@ -146,6 +153,8 @@ public abstract class IccRecords extends Handler implements IccConstants {
 
     @UnsupportedAppUsage
     private String mSpn;
+
+    protected int mSmsCountOnIcc = -1;
 
     @UnsupportedAppUsage
     protected String mGid1;
@@ -216,6 +225,9 @@ public abstract class IccRecords extends Handler implements IccConstants {
     public static final int EVENT_REFRESH = 31; // ICC refresh occurred
     protected static final int EVENT_APP_READY = 1;
     private static final int EVENT_AKA_AUTHENTICATE_DONE          = 90;
+    protected static final int EVENT_GET_SMS_RECORD_SIZE_DONE = 28;
+
+    protected static final int EVENT_APP_DETECTED = 101;
 
     public static final int CALL_FORWARDING_STATUS_DISABLED = 0;
     public static final int CALL_FORWARDING_STATUS_ENABLED = 1;
@@ -232,6 +244,7 @@ public abstract class IccRecords extends Handler implements IccConstants {
                 + " mCi=" + mCi
                 + " mFh=" + mFh
                 + " mParentApp=" + mParentApp
+                + " mEssentialRecordsToLoad=" + mEssentialRecordsToLoad
                 + " recordsToLoad=" + mRecordsToLoad
                 + " adnCache=" + mAdnCache
                 + " recordsRequested=" + mRecordsRequested
@@ -283,6 +296,8 @@ public abstract class IccRecords extends Handler implements IccConstants {
 
         mCarrierTestOverride = new CarrierTestOverride();
         mCi.registerForIccRefresh(this, EVENT_REFRESH, null);
+
+        mParentApp.registerForDetected(this, EVENT_APP_DETECTED, null);
     }
 
     // Override IccRecords for testing
@@ -306,6 +321,7 @@ public abstract class IccRecords extends Handler implements IccConstants {
         synchronized (mLock) {
             mLock.notifyAll();
         }
+        mParentApp.unregisterForDetected(this);
 
         mCi.unregisterForIccRefresh(this);
         mParentApp = null;
@@ -319,6 +335,11 @@ public abstract class IccRecords extends Handler implements IccConstants {
     }
 
     public abstract void onReady();
+
+    protected void onDetected() {
+        mRecordsRequested = false;
+        mLoaded.set(false);
+    }
 
     //***** Public Methods
     public AdnRecordCache getAdnCache() {
@@ -371,6 +392,20 @@ public abstract class IccRecords extends Handler implements IccConstants {
     }
 
     @UnsupportedAppUsage
+    public void registerForEssentialRecordsLoaded(Handler h, int what, Object obj) {
+        if (mDestroyed.get()) {
+            return;
+        }
+
+        Registrant r = new Registrant(h, what, obj);
+        mEssentialRecordsLoadedRegistrants.add(r);
+
+        if (getEssentialRecordsLoaded()) {
+            r.notifyRegistrant(new AsyncResult(null, null, null));
+        }
+    }
+
+    @UnsupportedAppUsage
     public void registerForRecordsLoaded(Handler h, int what, Object obj) {
         if (mDestroyed.get()) {
             return;
@@ -383,6 +418,12 @@ public abstract class IccRecords extends Handler implements IccConstants {
             r.notifyRegistrant(new AsyncResult(null, null, null));
         }
     }
+
+    @UnsupportedAppUsage
+    public void unregisterForEssentialRecordsLoaded(Handler h) {
+        mEssentialRecordsLoadedRegistrants.remove(h);
+    }
+
     @UnsupportedAppUsage
     public void unregisterForRecordsLoaded(Handler h) {
         mRecordsLoadedRegistrants.remove(h);
@@ -772,6 +813,11 @@ public abstract class IccRecords extends Handler implements IccConstants {
     public abstract void onRefresh(boolean fileChanged, int[] fileList);
 
     @UnsupportedAppUsage
+    public boolean getEssentialRecordsLoaded() {
+        return mEssentialRecordsToLoad == 0 && mRecordsRequested;
+    }
+
+    @UnsupportedAppUsage
     public boolean getRecordsLoaded() {
         return mRecordsToLoad == 0 && mRecordsRequested;
     }
@@ -792,6 +838,12 @@ public abstract class IccRecords extends Handler implements IccConstants {
         AsyncResult ar;
 
         switch (msg.what) {
+            case EVENT_APP_DETECTED:
+                if (DBG) log("App detected");
+                mLockedRecordsReqReason = LOCKED_RECORDS_REQ_REASON_NONE;
+                onDetected();
+                break;
+
             case EVENT_GET_ICC_RECORD_DONE:
                 try {
                     ar = (AsyncResult) msg.obj;
@@ -840,6 +892,28 @@ public abstract class IccRecords extends Handler implements IccConstants {
                     mLock.notifyAll();
                 }
 
+                break;
+            case EVENT_GET_SMS_RECORD_SIZE_DONE:
+                ar = (AsyncResult) msg.obj;
+
+                if (ar.exception != null) {
+                    loge("Exception in EVENT_GET_SMS_RECORD_SIZE_DONE " + ar.exception);
+                    break;
+                }
+
+                int[] recordSize = (int[])ar.result;
+                try {
+                    // recordSize[0]  is the record length
+                    // recordSize[1]  is the total length of the EF file
+                    // recordSize[2]  is the number of records in the EF file
+                    mSmsCountOnIcc = recordSize[2];
+                    log("EVENT_GET_SMS_RECORD_SIZE_DONE Size " + recordSize[0]
+                            + " total " + recordSize[1]
+                                    + " record " + recordSize[2]);
+                } catch (ArrayIndexOutOfBoundsException exc) {
+                    loge("ArrayIndexOutOfBoundsException in EVENT_GET_SMS_RECORD_SIZE_DONE: "
+                            + exc.toString());
+                }
                 break;
 
             default:
@@ -918,6 +992,8 @@ public abstract class IccRecords extends Handler implements IccConstants {
     }
 
     protected abstract void onRecordLoaded();
+
+    protected abstract void onAllEssentialRecordsLoaded();
 
     protected abstract void onAllRecordsLoaded();
 
@@ -1181,12 +1257,26 @@ public abstract class IccRecords extends Handler implements IccConstants {
         return carrierNameDisplayCondition;
     }
 
+    /**
+     * To get SMS capacity count on ICC card.
+     */
+    public int getSmsCapacityOnIcc() {
+        if (DBG) log("getSmsCapacityOnIcc: " + mSmsCountOnIcc);
+        return mSmsCountOnIcc;
+    }
+
     public void dump(FileDescriptor fd, PrintWriter pw, String[] args) {
         pw.println("IccRecords: " + this);
         pw.println(" mDestroyed=" + mDestroyed);
         pw.println(" mCi=" + mCi);
         pw.println(" mFh=" + mFh);
         pw.println(" mParentApp=" + mParentApp);
+        pw.println(" mEssentialRecordsLoadedRegistrants: size="
+                + mEssentialRecordsLoadedRegistrants.size());
+        for (int i = 0; i < mEssentialRecordsLoadedRegistrants.size(); i++) {
+            pw.println("  mEssentialRecordsLoadedRegistrants[" + i + "]="
+                    + ((Registrant)mEssentialRecordsLoadedRegistrants.get(i)).getHandler());
+        }
         pw.println(" recordsLoadedRegistrants: size=" + mRecordsLoadedRegistrants.size());
         for (int i = 0; i < mRecordsLoadedRegistrants.size(); i++) {
             pw.println("  recordsLoadedRegistrants[" + i + "]="
@@ -1227,6 +1317,7 @@ public abstract class IccRecords extends Handler implements IccConstants {
         }
         pw.println(" mRecordsRequested=" + mRecordsRequested);
         pw.println(" mLockedRecordsReqReason=" + mLockedRecordsReqReason);
+        pw.println(" mEssentialRecordsToLoad=" + mEssentialRecordsToLoad);
         pw.println(" mRecordsToLoad=" + mRecordsToLoad);
         pw.println(" mRdnCache=" + mAdnCache);
 

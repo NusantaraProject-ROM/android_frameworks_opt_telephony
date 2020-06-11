@@ -57,6 +57,7 @@ java_library {
         "android.hardware.radio-V1.4-java",
         "voip-common",
         "ims-common",
+        "telephony-ext",
         "services",
     ],
     static_libs: [

@@ -664,7 +664,7 @@ public class GsmCdmaPhoneTest extends TelephonyTest {
         doReturn(imsi).when(mSimRecords).getIMSI();
         mPhoneUT.getCallForwardingOption(CF_REASON_UNCONDITIONAL, null);
         verify(mSimulatedCommandsVerifier).queryCallForwardStatus(
-                eq(CF_REASON_UNCONDITIONAL), eq(CommandsInterface.SERVICE_CLASS_VOICE),
+                eq(CF_REASON_UNCONDITIONAL), anyInt(),
                 nullable(String.class), nullable(Message.class));
         waitForMs(50);
         verify(mSimRecords).setVoiceCallForwardingFlag(anyInt(), anyBoolean(),
@@ -702,6 +702,17 @@ public class GsmCdmaPhoneTest extends TelephonyTest {
                 nullable(Message.class));
         waitForMs(50);
         verify(mSimRecords).setVoiceCallForwardingFlag(anyInt(), anyBoolean(), eq(cfNumber));
+    }
+
+    @Test
+    public void testSetVideoCallForwardingPreference() {
+        mPhoneUT.setVideoCallForwardingPreference(false);
+        boolean cfPref = mPhoneUT.getVideoCallForwardingPreference();
+        assertFalse(cfPref);
+
+        mPhoneUT.setVideoCallForwardingPreference(true);
+        cfPref = mPhoneUT.getVideoCallForwardingPreference();
+        assertTrue(cfPref);
     }
 
     /**
@@ -803,8 +814,9 @@ public class GsmCdmaPhoneTest extends TelephonyTest {
         // verify that wakeLock is acquired in ECM
         assertEquals(true, mPhoneUT.getWakeLock().isHeld());
 
-        mPhoneUT.setOnEcbModeExitResponse(mTestHandler, EVENT_EMERGENCY_CALLBACK_MODE_EXIT, null);
-        mPhoneUT.registerForEmergencyCallToggle(mTestHandler, EVENT_EMERGENCY_CALL_TOGGLE, null);
+        EcbmHandler.getInstance().setOnEcbModeExitResponse(mTestHandler,
+                EVENT_EMERGENCY_CALLBACK_MODE_EXIT, null);
+         mPhoneUT.registerForEmergencyCallToggle(mTestHandler, EVENT_EMERGENCY_CALL_TOGGLE, null);
 
         // verify handling of emergency callback mode exit
         mSimulatedCommands.notifyExitEmergencyCallbackMode();
@@ -891,7 +903,8 @@ public class GsmCdmaPhoneTest extends TelephonyTest {
         // verify that wakeLock is acquired in ECM
         assertEquals(true, mPhoneUT.getWakeLock().isHeld());
 
-        mPhoneUT.setOnEcbModeExitResponse(mTestHandler, EVENT_EMERGENCY_CALLBACK_MODE_EXIT, null);
+        EcbmHandler.getInstance().setOnEcbModeExitResponse(mTestHandler,
+                EVENT_EMERGENCY_CALLBACK_MODE_EXIT, null);
         mPhoneUT.registerForEmergencyCallToggle(mTestHandler, EVENT_EMERGENCY_CALL_TOGGLE, null);
 
         // verify handling of emergency callback mode exit when modem resets
@@ -949,6 +962,7 @@ public class GsmCdmaPhoneTest extends TelephonyTest {
                 getSubIdUsingPhoneId(anyInt());
         assertEquals(false, mPhoneUT.getCallForwardingIndicator());
 
+        doReturn(true).when(mSubscriptionController).isActiveSubId(anyInt());
         // valid subId, sharedPreference not present
         int subId1 = 0;
         int subId2 = 1;
