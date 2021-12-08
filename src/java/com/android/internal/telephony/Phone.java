@@ -81,6 +81,7 @@ import com.android.internal.telephony.dataconnection.DcTracker;
 import com.android.internal.telephony.dataconnection.LinkBandwidthEstimator;
 import com.android.internal.telephony.dataconnection.TransportManager;
 import com.android.internal.telephony.emergency.EmergencyNumberTracker;
+import com.android.internal.telephony.imsphone.ImsPhone;
 import com.android.internal.telephony.imsphone.ImsPhoneCall;
 import com.android.internal.telephony.metrics.SmsStats;
 import com.android.internal.telephony.metrics.VoiceCallSessionStats;
@@ -3952,6 +3953,11 @@ public abstract class Phone extends Handler implements PhoneInternalInterface {
         return mImsPhone;
     }
 
+    @VisibleForTesting
+    public void setImsPhone(ImsPhone imsPhone) {
+        mImsPhone = imsPhone;
+    }
+
     /**
      * Returns Carrier specific information that will be used to encrypt the IMSI and IMPI.
      * @param keyType whether the key is being used for WLAN or ePDG.
@@ -4397,13 +4403,6 @@ public abstract class Phone extends Handler implements PhoneInternalInterface {
         }
     }
 
-    protected void setPreferredNetworkTypeIfSimLoaded() {
-        int subId = getSubId();
-        if (SubscriptionManager.isValidSubscriptionId(subId)) {
-            updateAllowedNetworkTypes(null);
-        }
-    }
-
     /**
      * Registers the handler when phone radio  capability is changed.
      *
@@ -4653,6 +4652,21 @@ public abstract class Phone extends Handler implements PhoneInternalInterface {
      **/
     public void setSimPowerState(int state, Message result, WorkSource workSource) {
         mCi.setSimCardPower(state, result, workSource);
+    }
+
+    /**
+     * Enable or disable Voice over NR (VoNR)
+     * @param enabled enable or disable VoNR.
+     **/
+    public void setVoNrEnabled(boolean enabled, Message result, WorkSource workSource) {
+        mCi.setVoNrEnabled(enabled, result, workSource);
+    }
+
+    /**
+     * Is voice over NR enabled
+     */
+    public void isVoNrEnabled(Message message, WorkSource workSource) {
+        mCi.isVoNrEnabled(message, workSource);
     }
 
     public void setCarrierTestOverride(String mccmnc, String imsi, String iccid, String gid1,
